@@ -2,11 +2,13 @@
 
 非 Root Android 设备上，在应用内部运行**同包名、不同签名**的第三方 APK，与宿主已安装版本共存。
 
-> 当前状态：**阶段 0/1 交付（设计与可行性）+ 阶段 2 骨架代码，已在真机跑通**。
-> 还没有任何"能真正跑第三方 APK"的引擎接入 —— 这是刻意安排：先证明引擎可行，再写 UI。
+> 当前状态：**阶段 3 正式框架已完成**（Room 数据层 + 六页面 UI + 引擎接入 + 签名冲突流 + 数据管理 + 诊断 + 悬浮返回按钮）。
+> 引擎已在真机验证：安装 + 启动成功、同包名异签名可并存、危险权限拦截生效、后台保活/通知正常。
+>
+> 支持范围：**API 31–37（Android 12–17）**，`targetSdk 37` / `compileSdk 36` / `minSdk 31` / 仅 arm64-v8a。
 >
 > 真机基线：realme RMX3888 / **Android 16（API 36）** / **仅 arm64-v8a** / 4KB 页。
-> 已在该机验证：APK 解析（包名/版本/签名/SHA-256 与 `apksigner` 完全一致）、骨架运行、系统级签名冲突（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）。
+> 已在该机验证：APK 解析（包名/版本/签名/SHA-256 与 `apksigner` 完全一致）、系统级签名冲突（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）。
 > 记录见 [docs/device-matrix.md](docs/device-matrix.md)。
 
 ---
@@ -67,7 +69,7 @@ gradle wrapper --gradle-version 8.9
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-要求：JDK 17、Android SDK（compileSdk 35）、`minSdk 26`。
+要求：JDK 17、Android SDK（`compileSdk 36`，platform `android-36`）、`minSdk 31`。
 详见 [docs/10-setup.md](docs/10-setup.md)。
 
 ---

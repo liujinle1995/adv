@@ -318,6 +318,6 @@ class BlackBoxEngineAdapter(
         const val TAG = "BlackBoxEngine"
         const val ENGINE_VERSION = "2.1.0-adv"
         const val MIN_SDK = 31
-        const val MAX_SDK = 36
+        const val MAX_SDK = 37
     }
 }

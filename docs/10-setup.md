@@ -11,7 +11,9 @@
 | adb | `C:\Users\94591\AppData\Local\Android\Sdk\platform-tools\adb.exe` |
 | 已连接真机 | **无**（`adb devices` 为空）→ 阶段 2 必须接一台 |
 
-本项目骨架使用：AGP **8.7.3** / Gradle **8.9** / Kotlin **2.0.21** / `compileSdk 35` / `minSdk 26` / `targetSdk 35`。
+本项目使用：AGP **8.7.3** / Gradle **8.11.1** / Kotlin **2.0.21** / `compileSdk 36` / `minSdk 31` / `targetSdk 37`（支持 API 31–37，即 Android 12–17）。
+
+> 注：`targetSdk 37` 声明支持到 Android 17，但 `compileSdk` 保持 36 —— 本机 `platforms/android-37.0` 是新版 SDK 管理器装的（package.xml 为 XML v4 schema），AGP 8.7.x 只能解析 XML v3。项目代码未使用 API 37 新 API，故用 `android-36` 编译即可。若后续升级 AGP 到能识别 `android-37.0` 的版本，可再把 `compileSdk` 提到 37。
 
 ### 1.1 本机已实测的环境坑（重要）
 
