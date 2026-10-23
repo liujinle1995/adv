@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace 'top.niunaijun.android_mirror'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 21
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    // BlackReflection 注解处理器只支持到 Java 8，这里必须降到 1.8
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // AGP 8 起 AIDL 默认关闭；该模块的 mirror 类依赖 AIDL 生成的 Stub/Proxy
+    buildFeatures {
+        aidl true
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation project(':bb-fake')
+    implementation 'com.github.CodingGay.BlackReflection:core:1.1.2'
+    annotationProcessor 'com.github.CodingGay.BlackReflection:compiler:1.1.2'
+}

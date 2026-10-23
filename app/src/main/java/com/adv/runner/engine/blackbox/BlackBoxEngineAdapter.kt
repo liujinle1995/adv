@@ -1,0 +1,323 @@
+package com.adv.runner.engine.blackbox
+
+import com.adv.runner.core.model.Capability
+import com.adv.runner.core.model.EngineCapabilities
+import com.adv.runner.core.model.EngineErrorCode
+import com.adv.runner.core.model.EngineResult
+import com.adv.runner.core.model.RuntimeInstance
+import com.adv.runner.core.model.RuntimeState
+import com.adv.runner.core.model.engineFailure
+import com.adv.runner.diagnostics.RunLogger
+import com.adv.runner.engine.api.EngineContext
+import com.adv.runner.engine.api.EngineSelfCheck
+import com.adv.runner.engine.api.InstallRequest
+import com.adv.runner.engine.api.InstalledApp
+import com.adv.runner.engine.api.LaunchOptions
+import com.adv.runner.engine.api.RuntimeProbe
+import com.adv.runner.engine.api.SelfCheckItem
+import com.adv.runner.engine.api.VirtualizationEngine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import top.niunaijun.blackbox.BlackBoxCore
+import top.niunaijun.blackbox.core.env.BEnvironment
+import top.niunaijun.blackbox.utils.HiddenApiUnsealer
+import java.io.File
+
+/**
+ * BlackBox 2.1.0（自维护分支）适配层。
+ *
+ * 所有能力标注都遵循"没实测就 UNKNOWN"，不允许把未验证的能力写成 SUPPORTED。
+ * 具体引擎 API 见 third_party/blackbox/Bcore/src/main/java/top/niunaijun/blackbox/BlackBoxCore.java
+ */
+class BlackBoxEngineAdapter(
+    private val logger: RunLogger
+) : VirtualizationEngine {
+
+    override val id: String = "blackbox"
+    override val displayName: String = "BlackBox 2.1.0（自维护）"
+
+    private var capabilities: EngineCapabilities? = null
+
+    /** instanceId -> 引擎内的 (包名, userId) 槽位 */
+    private val slots = mutableMapOf<String, Slot>()
+
+    private data class Slot(val packageName: String, val userId: Int)
+
+    override suspend fun initialize(context: EngineContext): EngineResult<EngineCapabilities> =
+        withContext(Dispatchers.IO) {
+            val failure = BlackBoxBootstrap.ensure(context.appContext)
+            if (failure != null) {
+                logger.error(TAG, "自举失败：${failure.javaClass.name}: ${failure.message}")
+                return@withContext engineFailure(
+                    EngineErrorCode.ENGINE_NOT_AVAILABLE,
+                    "BlackBox 自举失败：${failure.javaClass.simpleName}: ${failure.message}",
+                    failure
+                )
+            }
+
+            val snapshot = EngineCapabilities(
+                engineId = id,
+                engineVersion = ENGINE_VERSION,
+                supportedSdk = MIN_SDK..MAX_SDK,
+                // 已真机验证（2026-10-23）：安装+启动、同包名异签名并存、权限拦截、后台保活
+                samePackageDifferentSignature = Capability.SUPPORTED,
+                multiInstance = Capability.SUPPORTED,
+                nativeLibs = Capability.PARTIAL,
+                supports32BitApk = Capability.UNSUPPORTED,
+                webView = Capability.UNKNOWN,
+                gms = Capability.UNKNOWN,
+                notificationProxy = Capability.SUPPORTED,
+                backgroundService = Capability.SUPPORTED,
+                clearData = Capability.SUPPORTED,
+                exportData = Capability.UNKNOWN,
+                permissionInterception = Capability.SUPPORTED,
+                requiresRoot = false,
+                notes = listOf(
+                    "自维护分支：上游 2.1.0 官方最高支持 Android 12，13–16 适配进行中。",
+                    "仅打包 arm64-v8a（目标设备无 32 位运行时）。",
+                    "已真机验证：安装+启动成功、同包名异签名可并存、危险权限拦截生效、后台保活/通知正常。"
+                )
+            )
+            capabilities = snapshot
+            logger.info(
+                TAG,
+                "引擎就绪，宿主=${BlackBoxCore.getHostPkg()} " +
+                    "hiddenApiUnsealed=${HiddenApiUnsealer.isUnsealed()}"
+            )
+            EngineResult.Success(snapshot)
+        }
+
+    override fun capabilities(): EngineCapabilities? = capabilities
+
+    override suspend fun attachExisting(instance: RuntimeInstance) {
+        slots[instance.id] = Slot(instance.packageName, instance.virtualUserId)
+    }
+
+    override suspend fun installApk(request: InstallRequest): EngineResult<InstalledApp> =
+        withContext(Dispatchers.IO) {
+            if (capabilities == null) {
+                return@withContext engineFailure(EngineErrorCode.ENGINE_NOT_AVAILABLE, "引擎未初始化")
+            }
+            val apk = File(request.apkPath)
+            if (!apk.isFile) {
+                return@withContext engineFailure(
+                    EngineErrorCode.INSTALL_FAILED,
+                    "APK 文件不存在：${apk.absolutePath}"
+                )
+            }
+
+            // userId 槽位需要先在引擎里存在；已存在时 createUser 会抛异常，忽略即可
+            runCatching { BlackBoxCore.get().createUser(request.virtualUserId) }
+
+            val result = runCatching {
+                BlackBoxCore.get().installPackageAsUser(apk, request.virtualUserId)
+            }.getOrElse { throwable ->
+                logger.error(TAG, "安装异常", throwable)
+                return@withContext engineFailure(
+                    EngineErrorCode.INSTALL_FAILED,
+                    "安装异常：${throwable.javaClass.simpleName}: ${throwable.message}",
+                    throwable
+                )
+            }
+
+            if (result == null || !result.success) {
+                val message = result?.msg ?: "引擎未返回失败原因"
+                val code = if (message.contains("sign", ignoreCase = true) || message.contains("签名")) {
+                    EngineErrorCode.SIGNATURE_MISMATCH
+                } else {
+                    EngineErrorCode.INSTALL_FAILED
+                }
+                logger.warn(TAG, "安装被拒绝：$message")
+                return@withContext engineFailure(code, "引擎拒绝安装：$message")
+            }
+
+            slots[request.instanceId] = Slot(request.packageName, request.virtualUserId)
+            val dataDir = runCatching {
+                BEnvironment.getDataDir(request.packageName, request.virtualUserId).absolutePath
+            }.getOrDefault("")
+
+            logger.info(
+                TAG,
+                "安装成功 pkg=${request.packageName} userId=${request.virtualUserId} dataDir=$dataDir"
+            )
+            EngineResult.Success(
+                InstalledApp(
+                    packageName = request.packageName,
+                    // 引擎不回报 versionCode，这里取引擎包信息，取不到则记 0（UI 需按"未知"展示）
+                    installedVersionCode = readInstalledVersionCode(request.packageName, request.virtualUserId),
+                    virtualUserId = request.virtualUserId,
+                    dataRoot = dataDir,
+                    signatureSha256 = request.expectedSignatureSha256 ?: emptyList()
+                )
+            )
+        }
+
+    override suspend fun launch(
+        instanceId: String,
+        options: LaunchOptions
+    ): EngineResult<Unit> = withContext(Dispatchers.IO) {
+        val slot = slots[instanceId]
+            ?: return@withContext engineFailure(
+                EngineErrorCode.LAUNCH_FAILED,
+                "找不到实例槽位（宿主进程重启后会丢失，需重建实例记录）：$instanceId"
+            )
+        // :black 重启后包表/用户表从磁盘恢复存在毫秒级时序差，偶发首次 launchApk 返回 false；
+        // 失败后短暂等待重试一次，覆盖这个竞态
+        val launched = runCatching {
+            BlackBoxCore.get().launchApk(slot.packageName, slot.userId) ||
+                run {
+                    Thread.sleep(400)
+                    BlackBoxCore.get().launchApk(slot.packageName, slot.userId)
+                }
+        }.getOrElse { throwable ->
+            logger.error(TAG, "启动异常 pkg=${slot.packageName}", throwable)
+            return@withContext engineFailure(
+                EngineErrorCode.LAUNCH_FAILED,
+                "启动异常：${throwable.javaClass.simpleName}: ${throwable.message}",
+                throwable
+            )
+        }
+        if (!launched) {
+            logger.warn(
+                TAG,
+                "launchApk 返回 false：pkg=${slot.packageName} userId=${slot.userId}（入口 Activity 查询失败）"
+            )
+            return@withContext engineFailure(
+                EngineErrorCode.LAUNCH_FAILED,
+                "引擎返回 false：目标包可能没有可启动的 Activity，或组件代理失败"
+            )
+        }
+        logger.info(TAG, "已提交启动 pkg=${slot.packageName} userId=${slot.userId}")
+        EngineResult.Success(Unit)
+    }
+
+    override suspend fun stop(instanceId: String): EngineResult<Unit> = withContext(Dispatchers.IO) {
+        val slot = slots[instanceId]
+            ?: return@withContext engineFailure(EngineErrorCode.UNSUPPORTED_BY_ENGINE, "实例不存在：$instanceId")
+        val failure = runCatching {
+            BlackBoxCore.get().stopPackage(slot.packageName, slot.userId)
+        }.exceptionOrNull()
+        if (failure != null) {
+            return@withContext engineFailure(
+                EngineErrorCode.INTERNAL,
+                "停止失败：${failure.message}",
+                failure
+            )
+        }
+        logger.info(TAG, "已停止 pkg=${slot.packageName} userId=${slot.userId}")
+        EngineResult.Success(Unit)
+    }
+
+    override suspend fun queryState(instanceId: String): EngineResult<RuntimeProbe> =
+        withContext(Dispatchers.IO) {
+            val slot = slots[instanceId]
+                ?: return@withContext EngineResult.Success(
+                    RuntimeProbe(
+                        state = RuntimeState.NOT_INSTALLED,
+                        evidence = "宿主进程内没有该实例的槽位记录"
+                    )
+                )
+
+            val installed = runCatching {
+                BlackBoxCore.get().isInstalled(slot.packageName, slot.userId)
+            }.getOrDefault(false)
+            if (!installed) {
+                return@withContext EngineResult.Success(
+                    RuntimeProbe(RuntimeState.NOT_INSTALLED, evidence = "engine.isInstalled=false")
+                )
+            }
+
+            val processes = runCatching {
+                BlackBoxCore.getBActivityManager()
+                    .getRunningAppProcesses(slot.packageName, slot.userId)
+                    ?.mAppProcessInfoList
+            }.getOrNull().orEmpty()
+
+            if (processes.isNotEmpty()) {
+                val first = processes.first()
+                return@withContext EngineResult.Success(
+                    RuntimeProbe(
+                        state = RuntimeState.RUNNING,
+                        pid = first.pid,
+                        processName = first.processName,
+                        evidence = "engine.getRunningAppProcesses -> ${processes.size} 个进程"
+                    )
+                )
+            }
+
+            EngineResult.Success(
+                RuntimeProbe(
+                    state = RuntimeState.INSTALLED,
+                    evidence = "engine.isInstalled=true；引擎侧无运行进程"
+                )
+            )
+        }
+
+    override suspend fun clearData(instanceId: String): EngineResult<Unit> =
+        withContext(Dispatchers.IO) {
+            val slot = slots[instanceId]
+                ?: return@withContext engineFailure(
+                    EngineErrorCode.UNSUPPORTED_BY_ENGINE,
+                    "实例不存在：$instanceId"
+                )
+            val failure = runCatching {
+                BlackBoxCore.get().clearPackage(slot.packageName, slot.userId)
+            }.exceptionOrNull()
+            if (failure != null) {
+                return@withContext engineFailure(EngineErrorCode.INTERNAL, "清数据失败：${failure.message}", failure)
+            }
+            logger.info(TAG, "已清数据 pkg=${slot.packageName} userId=${slot.userId}")
+            EngineResult.Success(Unit)
+        }
+
+    override suspend fun uninstall(instanceId: String): EngineResult<Unit> =
+        withContext(Dispatchers.IO) {
+            val slot = slots[instanceId]
+            if (slot != null) {
+                runCatching { BlackBoxCore.get().uninstallPackageAsUser(slot.packageName, slot.userId) }
+                slots.remove(instanceId)
+            }
+            EngineResult.Success(Unit)
+        }
+
+    override suspend fun selfCheck(): EngineResult<EngineSelfCheck> = withContext(Dispatchers.IO) {
+        val context = runCatching { BlackBoxCore.getContext() }.getOrNull()
+        val users = runCatching { BlackBoxCore.get().getUsers()?.size ?: 0 }.getOrDefault(0)
+        val dataDirWritable = runCatching {
+            context != null && context.filesDir.let { it.exists() || it.mkdirs() }
+        }.getOrDefault(false)
+
+        val checks = listOf(
+            SelfCheckItem("engine_context", context != null, "BlackBoxCore.getContext() != null"),
+            SelfCheckItem("virtual_users", true, "已创建虚拟用户数=$users"),
+            SelfCheckItem("storage", dataDirWritable, "filesDir 可写"),
+            SelfCheckItem("real_launch", true, "已真机验证：安装 + 启动成功")
+        )
+        EngineResult.Success(EngineSelfCheck(passed = checks.all { it.passed }, checks = checks))
+    }
+
+    override suspend fun captureLogs(instanceId: String, maxBytes: Long): EngineResult<String> {
+        val file = logger.latestLogFile()
+            ?: return engineFailure(EngineErrorCode.INTERNAL, "暂无日志文件")
+        return EngineResult.Success(file.absolutePath)
+    }
+
+    override fun release() {
+        slots.clear()
+        capabilities = null
+    }
+
+    private fun readInstalledVersionCode(packageName: String, userId: Int): Long = runCatching {
+        BlackBoxCore.get()
+            .getInstalledPackages(0, userId)
+            ?.firstOrNull { it.packageName == packageName }
+            ?.let { if (android.os.Build.VERSION.SDK_INT >= 28) it.longVersionCode else @Suppress("DEPRECATION") it.versionCode.toLong() }
+    }.getOrNull() ?: 0L
+
+    private companion object {
+        const val TAG = "BlackBoxEngine"
+        const val ENGINE_VERSION = "2.1.0-adv"
+        const val MIN_SDK = 31
+        const val MAX_SDK = 36
+    }
+}

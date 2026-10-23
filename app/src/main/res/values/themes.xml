@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 仅用于 Activity 启动前的窗口背景；真正的主题由 Compose Material3 提供 -->
+    <style name="Theme.AdvRunner" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
