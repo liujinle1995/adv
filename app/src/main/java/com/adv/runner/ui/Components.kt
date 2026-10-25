@@ -3,13 +3,19 @@ package com.adv.runner.ui
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.tween
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -25,16 +31,23 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.adv.runner.core.model.ApkInfo
 import com.adv.runner.core.model.Capability
+import com.adv.runner.core.model.ExitReason
 import com.adv.runner.core.model.RunEvent
 import com.adv.runner.core.model.RuntimeInstance
+import com.adv.runner.core.model.RuntimeState
 import com.adv.runner.core.model.Severity
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -123,23 +136,10 @@ fun LoadingState(
 /* ---------------- 实例 / APK / 事件 展示组件 ---------------- */
 
 @Composable
-fun CapabilitiesCard(state: AppState) {
-    val c = state.caps ?: return
-    Text("引擎能力（未实测一律 UNKNOWN）", fontWeight = FontWeight.SemiBold)
-    Text("引擎：${c.engineId} ${c.engineVersion}", style = MaterialTheme.typography.bodySmall)
-    Text("声明支持：API ${c.supportedSdk.first}–${c.supportedSdk.last}", style = MaterialTheme.typography.bodySmall)
-    Text("同包名不同签名：${c.samePackageDifferentSignature}", style = MaterialTheme.typography.bodySmall)
-    Text("多实例：${c.multiInstance}", style = MaterialTheme.typography.bodySmall)
-    Text("原生库：${c.nativeLibs}", style = MaterialTheme.typography.bodySmall)
-    Text("清数据：${c.clearData}", style = MaterialTheme.typography.bodySmall)
-    Text("权限拦截：${c.permissionInterception}", style = MaterialTheme.typography.bodySmall)
-    c.notes.forEach { Text("· $it", style = MaterialTheme.typography.bodySmall) }
-}
-
-@Composable
 fun InstanceRow(
     instance: RuntimeInstance,
     busy: Boolean,
+    iconFile: File? = null,
     onOpen: () -> Unit,
     onLaunch: () -> Unit,
     onStop: () -> Unit,
@@ -180,17 +180,92 @@ fun InstanceRow(
             }
             .clickable(onClick = onOpen)
     ) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(instance.displayName, fontWeight = FontWeight.SemiBold)
-            Text(
-                "状态：${instance.state}  ·  userId=${instance.virtualUserId}  ·  引擎=${instance.engineId}",
-                style = MaterialTheme.typography.bodySmall
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onLaunch, enabled = !busy) { Text("启动") }
-                OutlinedButton(onClick = onStop, enabled = !busy) { Text("停止") }
-                OutlinedButton(onClick = onDelete, enabled = !busy) { Text("删除") }
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // 异常退出（非用户主动停止）时明确提示，避免用户以为"自己没关就关了"
+            val abnormal = instance.lastExitReason != null &&
+                instance.lastExitReason != ExitReason.USER_STOPPED &&
+                instance.state != RuntimeState.RUNNING &&
+                instance.state != RuntimeState.STARTING
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                AppIcon(file = iconFile, size = 44.dp)
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Text(instance.displayName, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "状态：${instance.state}  ·  userId=${instance.virtualUserId}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (abnormal) {
+                        Text(
+                            "上次异常退出（${instance.lastExitReason}），可重新启动",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
             }
+
+            // 操作按钮单独一行，避免窄屏被挤成换行
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onLaunch,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                ) { Text(if (abnormal) "重新启动" else "启动", maxLines = 1) }
+                OutlinedButton(
+                    onClick = onStop,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                ) { Text("停止", maxLines = 1) }
+                OutlinedButton(
+                    onClick = onDelete,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                ) { Text("删除", maxLines = 1) }
+            }
+        }
+    }
+}
+
+/**
+ * 应用图标。有缓存文件就显示，没有则用占位方块，避免列表出现空洞。
+ */
+@Composable
+fun AppIcon(file: File?, size: Dp = 44.dp) {
+    val bitmap = remember(file?.absolutePath, file?.lastModified()) {
+        file?.let { f -> runCatching { BitmapFactory.decodeFile(f.absolutePath) }.getOrNull() }
+    }
+    val shape = RoundedCornerShape(size * 0.22f)
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.size(size).clip(shape)
+        )
+    } else {
+        Box(
+            modifier = Modifier
+                .size(size)
+                .clip(shape)
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                "▦",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }

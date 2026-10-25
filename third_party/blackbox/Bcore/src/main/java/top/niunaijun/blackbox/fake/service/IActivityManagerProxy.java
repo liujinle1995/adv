@@ -149,7 +149,19 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                     Log.d(TAG, "hook app: " + auth);
                     IBinder providerBinder = null;
                     if (BActivityThread.getAppPid() != -1) {
-                        AppConfig appConfig = BlackBoxCore.getBActivityManager().initProcess(providerInfo.packageName, providerInfo.processName, BActivityThread.getUserId());
+                        AppConfig appConfig = BActivityThread.getAppConfig();
+                        // 本进程已绑定同一虚拟进程时直接复用当前配置：:black 进程被系统冻结
+                        // 杀死后内存注册表丢失，initProcess 会另开宿主进程重复绑定同一虚拟
+                        // 进程，两个进程 WebView 数据目录后缀相同会锁冲突 FATAL（真机实测）。
+                        if (appConfig == null
+                                || !appConfig.packageName.equals(providerInfo.packageName)
+                                || !appConfig.processName.equals(providerInfo.processName)
+                                || appConfig.userId != BActivityThread.getUserId()) {
+                            appConfig = BlackBoxCore.getBActivityManager().initProcess(providerInfo.packageName, providerInfo.processName, BActivityThread.getUserId());
+                        }
+                        if (appConfig == null) {
+                            return null;
+                        }
                         if (appConfig.bpid != BActivityThread.getAppPid()) {
                             providerBinder = BlackBoxCore.getBActivityManager().acquireContentProviderClient(providerInfo);
                         }

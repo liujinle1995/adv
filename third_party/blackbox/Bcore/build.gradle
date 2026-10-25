@@ -67,3 +67,32 @@ dependencies {
     implementation project(':bb-pine-xposed')
     implementation project(':bb-pine-xposed-res')
 }
+
+// ---------------------------------------------------------------------------
+// AIDL 生成文件注释清洗
+//
+// AGP 8.13 的 aidl 生成器会把完整命令行写进生成文件头部注释，形如：
+//   * Using: ...\blackbox\core\system\user\IBUserManagerService.aidl
+// Java 编译器在词法分析前会先处理 \uXXXX 转义（注释里也一样），
+// 路径中的 "\user\" 命中 "\u" 前缀但后面不是 4 位十六进制，javac 直接报
+// “非法的 Unicode 转义”，导致 :bb-core 编译失败。
+//
+// 这里在 Java 编译前把生成文件里的反斜杠序列改写掉（仅影响注释内容）。
+// 注意：Groovy 源码里同样不能出现 "\u" 字面量，用 (char) 92 拼接规避。
+// ---------------------------------------------------------------------------
+tasks.withType(JavaCompile).configureEach { task ->
+    task.doFirst {
+        def bs = (char) 92
+        def needle = "${bs}u"
+        def aidlOut = file("$buildDir/generated/aidl_source_output_dir")
+        if (!aidlOut.exists()) return
+        fileTree(aidlOut) { include '**/*.java' }.each { f ->
+            def text = f.getText('UTF-8')
+            if (text.contains(needle)) {
+                // 反斜杠 + u → 斜杠 + u，注释语义不变，但不再构成 \u 转义
+                f.setText(text.replace(needle, '/u'), 'UTF-8')
+            }
+        }
+    }
+}
+

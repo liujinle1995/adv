@@ -5,7 +5,8 @@
 > 当前状态：**阶段 3 正式框架已完成**（Room 数据层 + 六页面 UI + 引擎接入 + 签名冲突流 + 数据管理 + 诊断 + 悬浮返回按钮）。
 > 引擎已在真机验证：安装 + 启动成功、同包名异签名可并存、危险权限拦截生效、后台保活/通知正常。
 >
-> 支持范围：**API 31–37（Android 12–17）**，`targetSdk 37` / `compileSdk 36` / `minSdk 31` / 仅 arm64-v8a。
+> 支持范围：**API 31–37（Android 12–17）**，`targetSdk 37` / `compileSdk 37` / `minSdk 31` / 仅 arm64-v8a。
+> native 库已按 **16KB 页对齐**（`-Wl,-z,max-page-size=16384`），兼容 Android 15+ 的 16KB 页设备。
 >
 > 真机基线：realme RMX3888 / **Android 16（API 36）** / **仅 arm64-v8a** / 4KB 页。
 > 已在该机验证：APK 解析（包名/版本/签名/SHA-256 与 `apksigner` 完全一致）、系统级签名冲突（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）。

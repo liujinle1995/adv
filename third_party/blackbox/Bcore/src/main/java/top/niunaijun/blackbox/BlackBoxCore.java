@@ -75,6 +75,10 @@ public class BlackBoxCore extends ClientConfiguration {
     private static Context sContext;
     private ProcessType mProcessType;
     private final Map<String, IBinder> mServices = new HashMap<>();
+    // getService 重入保护：取服务 binder 依赖 SystemCallProvider，provider 获取路径上的
+    // resolveContentProvider / getContentProvider hook 会再次触发 getService，
+    // 不拦住会无限递归（真机 StackOverflowError，API 36 实测）。
+    private static final ThreadLocal<Boolean> sGettingService = new ThreadLocal<>();
     private Thread.UncaughtExceptionHandler mExceptionHandler;
     private ClientConfiguration mClientConfiguration;
     private final List<AppLifecycleCallback> mAppLifecycleCallbacks = new ArrayList<>();
@@ -155,13 +159,9 @@ public class BlackBoxCore extends ClientConfiguration {
         }
         if (isServerProcess()) {
             if (clientConfiguration.isEnableDaemonService()) {
-                Intent intent = new Intent();
-                intent.setClass(getContext(), DaemonService.class);
-                if (BuildCompat.isOreo()) {
-                    getContext().startForegroundService(intent);
-                } else {
-                    getContext().startService(intent);
-                }
+                // 把 :black 提为前台服务，降低被 ColorOS/OEM 冻结器当缓存进程回收的概率。
+                // 内部已做异常兜底：失败则退化成普通服务，不影响引擎可用性。
+                DaemonService.start(getContext());
             }
         }
         PineConfig.debug = true;
@@ -364,9 +364,21 @@ public class BlackBoxCore extends ClientConfiguration {
         if (binder != null && binder.isBinderAlive()) {
             return binder;
         }
+        if (sGettingService.get() != null) {
+            // 重入保护：同线程已处于取服务 binder 的 provider 调用链中，直接返回 null，
+            // 由调用方回退系统原始实现，切断 getService -> provider 调用 -> hook 回环
+            Slog.w(TAG, "getService reentrant, skip: " + name);
+            return null;
+        }
         Bundle bundle = new Bundle();
         bundle.putString("_B_|_server_name_", name);
-        Bundle vm = ProviderCall.callSafely(ProxyManifest.getBindProvider(), "VM", null, bundle);
+        sGettingService.set(Boolean.TRUE);
+        Bundle vm;
+        try {
+            vm = ProviderCall.callSafely(ProxyManifest.getBindProvider(), "VM", null, bundle);
+        } finally {
+            sGettingService.remove();
+        }
         binder = BundleCompat.getBinder(vm, "_B_|_server_");
         Slog.d(TAG, "getService: " + name + ", " + binder);
         mServices.put(name, binder);

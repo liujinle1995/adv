@@ -24,9 +24,8 @@ HOOK_JNI(jstring, canonicalize0, JNIEnv *env, jobject obj, jstring path) {
  *
  * Android 14+（实测 Android 16 / API 36 是这样）给 canonicalize0 的 native 签名
  * 加了一个 followLinks 参数，旧的 (String) 签名只剩一个 Java 包装方法。
- * 若仍按旧签名 RegisterNatives，ART 会抛
- *   NoSuchMethodError: no native method ...canonicalize0(Ljava/lang/String;)Ljava/lang/String;
- * 且异常未被清理，紧接着的 JNI 调用就会 SIGABRT 打死虚拟进程。
+ * 旧签名仍能被 GetMethodID 找到（包装方法在），但 JniHook::CheckFlags 现在会用
+ * 反射判它非 native 并主动跳过，不会再走 RegisterNatives 抛 NoSuchMethodError。
  */
 HOOK_JNI(jstring, canonicalize0_v2, JNIEnv *env, jobject obj, jstring path, jboolean followLinks) {
     jstring redirect = IO::redirectPath(env, path);
@@ -127,7 +126,8 @@ HOOK_JNI(jboolean, getSpace0, JNIEnv *env, jobject obj, jobject file, jint t) {
 void UnixFileSystemHook::init(JNIEnv *env) {
     const char *className = "java/io/UnixFileSystem";
     // 先试新签名（Android 14+），再试旧签名（Android 13 及以下）。
-    // 不存在的那一个会被 JniHook 安全跳过（GetMethodID 返回 null 并清异常）。
+    // 探测是安全的：新签名在 13 及以下不存在（GetMethodID 返回 null 并清异常）；
+    // 旧签名在 14+ 只是 Java 包装方法，CheckFlags 判非 native 后跳过，不会误注册。
     JniHook::HookJniFun(env, className, "canonicalize0", "(Ljava/lang/String;Z)Ljava/lang/String;",
                         (void *) new_canonicalize0_v2, (void **) (&orig_canonicalize0_v2), false);
     JniHook::HookJniFun(env, className, "canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;",

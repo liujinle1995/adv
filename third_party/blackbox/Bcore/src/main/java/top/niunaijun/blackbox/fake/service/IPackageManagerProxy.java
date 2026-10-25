@@ -25,6 +25,7 @@ import top.niunaijun.blackbox.fake.hook.MethodHook;
 import top.niunaijun.blackbox.fake.hook.ProxyMethod;
 import top.niunaijun.blackbox.fake.service.base.PkgMethodProxy;
 import top.niunaijun.blackbox.fake.service.base.ValueMethodProxy;
+import top.niunaijun.blackbox.proxy.ProxyManifest;
 import top.niunaijun.blackbox.utils.MethodParameterUtils;
 import top.niunaijun.blackbox.utils.Reflector;
 import top.niunaijun.blackbox.utils.Slog;
@@ -291,6 +292,12 @@ public class IPackageManagerProxy extends BinderInvocationStub {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
             String authority = (String) args[0];
+            // 引擎自身的 provider（SystemCallProvider / proxy_content_provider_N / FileProvider）
+            // 归属宿主真实 PM，必须走原始实现：否则取服务 binder 的 provider 调用会与本 hook
+            // 形成 getService -> provider 调用 -> resolveContentProvider 无限递归。
+            if (authority == null || ProxyManifest.isEngineProvider(authority)) {
+                return method.invoke(who, args);
+            }
             int flags = MethodParameterUtils.getInt(args, 1);
             ProviderInfo providerInfo = BlackBoxCore.getBPackageManager().resolveContentProvider(authority, flags, BActivityThread.getUserId());
             if (providerInfo == null) {

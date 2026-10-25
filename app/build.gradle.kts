@@ -7,9 +7,10 @@ plugins {
 
 android {
     namespace = "com.adv.runner"
-    // 用 AGP 可识别的 android-36 编译；本机 android-37.0 是新版 SDK 管理器的 XML v4 格式，
-    // AGP 8.7.x 解析不了。代码未使用 API 37 新 API，compileSdk 36 足够。
-    compileSdk = 36
+    // Android 17（API 37）正式支持：AGP 8.13 可解析新版 SDK 管理器的
+    // android-37.0（package.xml 为 repository XML v4），compileSdk 提升到 37，
+    // 使 targetSdk 37 的编译期 API 校验、行为变更 lint 真正生效。
+    compileSdk = 37
     ndkVersion = "27.0.12077973"
 
     defaultConfig {
@@ -17,8 +18,8 @@ android {
         // 需求：最低支持 Android 12（API 31），最高支持 Android 17（API 37）
         minSdk = 31
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.2.0-engine"
+        versionCode = 17
+        versionName = "0.4.1"
 
         ndk {
             // 目标设备（realme RMX3888 / Android 16）无 32 位运行时
@@ -48,6 +49,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 版本号与更新记录页从 BuildConfig 读取，避免多处硬编码不一致
+        buildConfig = true
     }
 
     packaging {
@@ -87,4 +90,35 @@ dependencies {
     ksp("androidx.room:room-compiler:$roomVersion")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+// ---------------------------------------------------------------------------
+// 发版一致性自检
+//
+// 「更新记录」的数据源是 src/main/java/com/adv/runner/data/Changelog.kt，
+// 必须与 defaultConfig.versionCode 同步。历史上出现过两次「改了功能却没写记录」，
+// 这里在每次构建的 preBuild 阶段自检，不一致就打印醒目告警（不阻断构建，
+// 避免开发中途被打断）。
+// ---------------------------------------------------------------------------
+tasks.register("checkChangelogVersion") {
+    doLast {
+        val changelog = file("src/main/java/com/adv/runner/data/Changelog.kt")
+        if (!changelog.exists()) return@doLast
+        val newest = Regex("""versionCode\s*=\s*(\d+)""")
+            .findAll(changelog.readText())
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .maxOrNull() ?: 0
+        val current = android.defaultConfig.versionCode ?: 0
+        if (newest != current) {
+            logger.warn(
+                "\n⚠⚠ 版本号与更新记录不一致：当前 versionCode=$current，" +
+                    "Changelog.kt 最新记录=$newest。\n" +
+                    "   请先在 data/Changelog.kt 补一条对应版本的记录。\n"
+            )
+        }
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn("checkChangelogVersion")
 }

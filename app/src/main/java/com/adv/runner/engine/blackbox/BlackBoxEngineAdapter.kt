@@ -9,6 +9,7 @@ import com.adv.runner.core.model.RuntimeState
 import com.adv.runner.core.model.engineFailure
 import com.adv.runner.diagnostics.RunLogger
 import com.adv.runner.engine.api.EngineContext
+import com.adv.runner.engine.api.EngineRuntimeStatus
 import com.adv.runner.engine.api.EngineSelfCheck
 import com.adv.runner.engine.api.InstallRequest
 import com.adv.runner.engine.api.InstalledApp
@@ -38,6 +39,9 @@ class BlackBoxEngineAdapter(
 
     private var capabilities: EngineCapabilities? = null
 
+    /** 自举时保存的 ApplicationContext，供运行状态查询使用。 */
+    private var appContext: android.content.Context? = null
+
     /** instanceId -> 引擎内的 (包名, userId) 槽位 */
     private val slots = mutableMapOf<String, Slot>()
 
@@ -45,6 +49,7 @@ class BlackBoxEngineAdapter(
 
     override suspend fun initialize(context: EngineContext): EngineResult<EngineCapabilities> =
         withContext(Dispatchers.IO) {
+            appContext = context.appContext
             val failure = BlackBoxBootstrap.ensure(context.appContext)
             if (failure != null) {
                 logger.error(TAG, "自举失败：${failure.javaClass.name}: ${failure.message}")
@@ -73,9 +78,9 @@ class BlackBoxEngineAdapter(
                 permissionInterception = Capability.SUPPORTED,
                 requiresRoot = false,
                 notes = listOf(
-                    "自维护分支：上游 2.1.0 官方最高支持 Android 12，13–16 适配进行中。",
-                    "仅打包 arm64-v8a（目标设备无 32 位运行时）。",
-                    "已真机验证：安装+启动成功、同包名异签名可并存、危险权限拦截生效、后台保活/通知正常。"
+                    "上游 2.1.0 官方最高只到 Android 12；本分支已适配到 Android 17（API 37），native 库 16KB 页对齐。",
+                    "仅打包 arm64-v8a：目标设备无 32 位运行时，v7a 应用无法运行。",
+                    "引擎服务进程以前台服务常驻，避免被系统冻结器回收。"
                 )
             )
             capabilities = snapshot
@@ -88,6 +93,73 @@ class BlackBoxEngineAdapter(
         }
 
     override fun capabilities(): EngineCapabilities? = capabilities
+
+    override suspend fun runtimeStatus(): EngineRuntimeStatus = withContext(Dispatchers.IO) {
+        val ctx = appContext
+        if (ctx == null || !BlackBoxBootstrap.isReady) {
+            return@withContext EngineRuntimeStatus(running = false, detail = "引擎未初始化")
+        }
+        val processes = runCatching {
+            val am = ctx.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager
+            am?.runningAppProcesses.orEmpty()
+        }.getOrElse { emptyList() }
+
+        // 同 uid 的进程对本应用可见：引擎服务进程名以 :black 结尾，
+        // 虚拟应用宿主进程名是 :p0 / :p1 …
+        val engineProc = processes.firstOrNull { it.processName.endsWith(":black") }
+        val virtualCount = processes.count { info ->
+            info.processName.substringAfterLast(':', "").matches(Regex("p\\d+"))
+        }
+        EngineRuntimeStatus(
+            running = engineProc != null,
+            processPid = engineProc?.pid,
+            virtualProcessCount = virtualCount,
+            detail = when {
+                engineProc == null -> "引擎服务进程未运行"
+                virtualCount == 0 -> "引擎运行中，暂无虚拟应用"
+                else -> "引擎运行中，$virtualCount 个虚拟应用在跑"
+            }
+        )
+    }
+
+
+    /**
+     * 预热：用一次最轻的远程调用把 `:black` 进程拉起来并完成服务注册。
+     *
+     * `:black` 平时不存在，直到第一次跨进程调用才由 ContentProvider 拉起；这一步
+     * 在点「启动」时才发生时，用户要等它初始化完（实测约 1s）。提前做掉这段，
+     * 点击启动就只剩 fork + Activity。
+     */
+    override suspend fun prewarm() {
+        if (capabilities == null) return
+        withContext(Dispatchers.IO) {
+            runCatching {
+                // 1) 触发 :black 拉起（ContentProvider 惰性启动）
+                BlackBoxCore.get().isInstalled("android.adv.prewarm.probe", 0)
+                // 2) 把引擎的各个系统服务一次性注册好。
+                //    这几个 getter 各自是一次跨进程调用，服务在 :black 里惰性创建；
+                //    不预热的话，首次 launch 要串行付掉全部建服务开销。
+                val services = listOf(
+                    "package_manager" to { BlackBoxCore.getBPackageManager() },
+                    "activity_manager" to { BlackBoxCore.getBActivityManager() },
+                    "job_manager" to { BlackBoxCore.getBJobManager() },
+                    "storage_manager" to { BlackBoxCore.getBStorageManager() },
+                )
+                val startedAt = System.currentTimeMillis()
+                services.forEach { (name, probe) ->
+                    runCatching { probe() }
+                        .onFailure { logger.debug(TAG, "预热 $name 失败：${it.javaClass.simpleName}") }
+                }
+                logger.debug(
+                    TAG,
+                    "引擎预热完成（${services.size} 个服务，${System.currentTimeMillis() - startedAt}ms）"
+                )
+            }.onFailure {
+                logger.debug(TAG, "引擎预热跳过：${it.javaClass.simpleName}: ${it.message}")
+            }
+        }
+    }
 
     override suspend fun attachExisting(instance: RuntimeInstance) {
         slots[instance.id] = Slot(instance.packageName, instance.virtualUserId)

@@ -22,10 +22,15 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.adv.runner.BuildConfig
+import com.adv.runner.R
 import com.adv.runner.ui.theme.ThemeMode
 import kotlinx.coroutines.CoroutineScope
 
@@ -42,7 +47,6 @@ fun SettingsScreen(state: AppState, scope: CoroutineScope) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.safeDrawing)
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -79,7 +83,10 @@ fun SettingsScreen(state: AppState, scope: CoroutineScope) {
         // 更新记录入口
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                SettingLinkRow("更新记录") { state.openChangelog() }
+                SettingLinkRow(
+                    label = "更新记录",
+                    value = "v${BuildConfig.VERSION_NAME}"
+                ) { state.openChangelog() }
             }
         }
 
@@ -114,6 +121,25 @@ private fun AppearanceCard(state: AppState) {
 
 @Composable
 private fun AboutCard(state: AppState) {
+    val context = LocalContext.current
+    // 安装时间：用来判断"手上这个包是不是最新构建"。若改了功能却忘了升版本号，
+    // 这里的时间会变而版本号不变，一眼就能看出来（更新记录跟着漏记的情况）。
+    val builtAt = remember {
+        runCatching {
+            val pm = context.packageManager
+            val info = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                pm.getPackageInfo(
+                    context.packageName,
+                    android.content.pm.PackageManager.PackageInfoFlags.of(0L)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(context.packageName, 0)
+            }
+            java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US)
+                .format(java.util.Date(info.lastUpdateTime))
+        }.getOrNull()
+    }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(vertical = 4.dp)) {
             // 版本号
@@ -125,11 +151,20 @@ private fun AboutCard(state: AppState) {
             ) {
                 Text("关于", style = MaterialTheme.typography.bodyMedium)
                 Spacer(Modifier.weight(1f))
-                Text(
-                    "ADV 本地运行器 v0.2.0",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        "${stringResource(R.string.app_name)} v${BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (builtAt != null) {
+                        Text(
+                            "构建 $builtAt（${BuildConfig.VERSION_CODE}）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
             HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
             SettingLinkRow("开源声明") { state.openLicenses() }

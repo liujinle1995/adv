@@ -98,13 +98,50 @@ static void *GetFieldMethod(JNIEnv *env, jobject field) {
     }
 }
 
-bool CheckFlags(void *artMethod) {
-    char *method = static_cast<char *>(artMethod);
-    if (!HasAccessFlag(method, kAccNative)) {
-        ALOGE("not native method");
+// 通过反射判断方法是否 native：
+// 不依赖 ArtMethod 内存布局，任何 API 级别都准。
+// Method.getModifiers() 是公开 API，dex 里的 native 标志位会如实反映。
+static bool IsNativeByReflection(JNIEnv *env, jclass clazz, jmethodID methodId) {
+    jclass executable = env->FindClass("java/lang/reflect/Executable");
+    if (!executable) {
+        env->ExceptionClear();
         return false;
     }
-    ClearFastNativeFlag(method);
+    jmethodID getModifiers = env->GetMethodID(executable, "getModifiers", "()I");
+    if (!getModifiers) {
+        env->ExceptionClear();
+        return false;
+    }
+    jobject reflected = env->ToReflectedMethod(clazz, methodId, JNI_TRUE);
+    if (!reflected) {
+        env->ExceptionClear();
+        return false;
+    }
+    jint modifiers = env->CallIntMethod(reflected, getModifiers);
+    env->DeleteLocalRef(reflected);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return (static_cast<uint32_t>(modifiers) & kAccNative) != 0;
+}
+
+bool CheckFlags(JNIEnv *env, jclass clazz, jmethodID methodId, void *artMethod) {
+    bool isNative = IsNativeByReflection(env, clazz, methodId);
+    if (!isNative && HookEnv.art_method_flags_offset != 0) {
+        // 反射抓不到结果时的兜底：读 flags 偏移。
+        // 偏移未定位成功时 offset 0 是入口指针/Class 指针，不能拿来判断。
+        isNative = HasAccessFlag(static_cast<char *>(artMethod), kAccNative);
+    }
+    if (!isNative) {
+        // 不是 native 就不要 RegisterNatives——Android 14+ 上
+        // UnixFileSystem.canonicalize0(String) 只是 Java 包装方法，强行注册会抛 NoSuchMethodError。
+        ALOGD("skip non-native method");
+        return false;
+    }
+    if (HookEnv.art_method_flags_offset != 0) {
+        ClearFastNativeFlag(static_cast<char *>(artMethod));
+    }
     return true;
 }
 
@@ -144,8 +181,8 @@ JniHook::HookJniFun(JNIEnv *env, const char *class_name, const char *method_name
     };
 
     auto artMethod = reinterpret_cast<uintptr_t *>(GetArtMethod(env, clazz, method));
-    if (!CheckFlags(artMethod)) {
-        ALOGE("check flags error. class：%s, method：%s", class_name, method_name);
+    if (!CheckFlags(env, clazz, method, artMethod)) {
+        ALOGD("check flags error. class：%s, method：%s", class_name, method_name);
         return;
     }
     *orig_fun = reinterpret_cast<void *>(artMethod[HookEnv.art_method_native_offset]);
@@ -177,6 +214,11 @@ __attribute__((section (".mytext")))  JNICALL void native_offset2
 
 __attribute__((section (".mytext")))  JNICALL void set_method_accessible
         (JNIEnv *env, jclass obj, jclass clazz, jobject method) {
+    if (HookEnv.art_method_flags_offset == 0) {
+        // flags 偏移未定位成功时 offset 0 是入口指针，直接写会把指针写坏，本应由调用方强制关闭。
+        ALOGD("skip setAccessible(method): method flags offset unresolved");
+        return;
+    }
     jmethodID methodId = env->FromReflectedMethod(method);
     char *art_method = static_cast<char *>(GetArtMethod(env, clazz, methodId));
     AddAccessFlag(art_method, kAccPublic);
@@ -187,6 +229,11 @@ __attribute__((section (".mytext")))  JNICALL void set_method_accessible
 
 __attribute__((section (".mytext")))  JNICALL void set_field_accessible
         (JNIEnv *env, jclass obj, jclass clazz, jobject field) {
+    if (HookEnv.art_field_flags_offset == 0) {
+        // 同 set_method_accessible：偏移未定位成功时不要盲写。
+        ALOGD("skip setAccessible(field): field flags offset unresolved");
+        return;
+    }
     char *artField = static_cast<char *>(GetFieldMethod(env, field));
     AddAccessFlag(artField, kAccPublic);
     if (HookEnv.api_level >= __ANDROID_API_Q__) {
@@ -247,13 +294,25 @@ void JniHook::InitJniHook(JNIEnv *env, int api_level) {
         flags = flags | kAccPublicApi;
     }
 
+    // Android 14+ （实测 API 34/36）链接期会给所有 native 方法统一置上
+    // kAccFastNative/kAccCriticalNative，精确等于 dex flags 的匹配会失落（结果 flags_offset=0），
+    // 扫描时必须把这个运行时标志位掉再比。
+    const uint32_t runtime_only_mask = kAccFastNative | kAccCriticalNative;
     char *start = reinterpret_cast<char *>(artMethod);
     for (int i = 1; i < HookEnv.art_method_size; ++i) {
         auto value = *(uint32_t *) (start + i * sizeof(uint32_t));
-        if (value == flags) {
+        if ((value & ~runtime_only_mask) == (flags & ~runtime_only_mask)) {
             HookEnv.art_method_flags_offset = i * sizeof(uint32_t);
             break;
         }
+    }
+    if (HookEnv.art_method_flags_offset == 0) {
+        // 找不到就打印 ArtMethod 头几个 word，方便下次新机型上定位布局。
+        ALOGD("method flags scan miss, artMethod head: %08x %08x %08x %08x %08x %08x %08x %08x",
+              *(uint32_t *) (start + 0), *(uint32_t *) (start + 4),
+              *(uint32_t *) (start + 8), *(uint32_t *) (start + 12),
+              *(uint32_t *) (start + 16), *(uint32_t *) (start + 20),
+              *(uint32_t *) (start + 24), *(uint32_t *) (start + 28));
     }
 
     flags = 0x0;
@@ -263,10 +322,12 @@ void JniHook::InitJniHook(JNIEnv *env, int api_level) {
     if (api_level >= __ANDROID_API_Q__) {
         flags = flags | kAccPublicApi;
     }
+    const uint32_t field_runtime_only_mask = kAccFastNative | kAccCriticalNative;
     char *fieldStart = reinterpret_cast<char *>(nativeOffsetField);
     for (int i = 1; i < HookEnv.art_field_size; ++i) {
         auto value = *(int32_t *) (fieldStart + i * sizeof(int32_t));
-        if (value == flags) {
+        if ((static_cast<uint32_t>(value) & ~field_runtime_only_mask) ==
+            (flags & ~field_runtime_only_mask)) {
             HookEnv.art_field_flags_offset = i * sizeof(int32_t);
             break;
         }

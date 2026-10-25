@@ -1,5 +1,6 @@
 package com.adv.runner
 
+import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.os.Build
 import android.os.Bundle
@@ -8,9 +9,13 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
 import com.adv.runner.apk.ApkAnalyzer
 import com.adv.runner.apk.ApkStore
 import com.adv.runner.core.control.InstanceController
@@ -38,6 +43,17 @@ class MainActivity : ComponentActivity() {
             val appContext = LocalContext.current.applicationContext
             val themeRepository = remember { ThemeRepository(appContext) }
             AdvTheme(mode = themeRepository.mode) {
+                // Android 15+ 对 targetSdk 35+ 强制 edge-to-edge：状态栏透明、内容延伸到状态栏下。
+                // 必须显式把状态栏/导航栏图标切换成与背景相反的颜色，否则浅色背景 + 浅色图标 = 看不见。
+                val view = LocalView.current
+                val lightBackground = MaterialTheme.colorScheme.background.luminance() > 0.5f
+                SideEffect {
+                    val window = (view.context as? Activity)?.window ?: return@SideEffect
+                    WindowCompat.getInsetsController(window, view).apply {
+                        isAppearanceLightStatusBars = lightBackground
+                        isAppearanceLightNavigationBars = lightBackground
+                    }
+                }
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val state = remember {
                         val logger = RunLogger(File(appContext.filesDir, "logs"))

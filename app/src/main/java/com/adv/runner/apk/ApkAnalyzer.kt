@@ -5,6 +5,9 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.Signature
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.os.Build
 import com.adv.runner.core.model.ApkInfo
 import com.adv.runner.core.model.ApkPermission
@@ -62,6 +65,9 @@ class ApkAnalyzer(private val context: Context) {
                 .getOrDefault(packageInfo.packageName ?: "未知")
 
             val signers = extractSigners(packageInfo)
+            // 顺带把应用图标落盘到 files/icons/<sha256>.png，供列表/详情展示。
+            // 不写数据库：路径由 sha256 推导，取不到文件就当没有图标。
+            cacheIcon(appInfo, file, digest)
             val certificates = signers.mapNotNull { signature -> parseCertificate(signature) }
             val signerSha256 = certificates.map { cert -> cert.encoded.sha256Hex() }
             val signerSubject = certificates.firstOrNull()?.subjectX500Principal?.name
@@ -237,6 +243,73 @@ class ApkAnalyzer(private val context: Context) {
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
+    /**
+     * 补生成图标：给"导入时还没有图标缓存"的历史实例用。
+     * 已有缓存直接返回，不重复解码。
+     */
+    fun ensureIcon(apkFile: File, sha256: String) {
+        val out = File(File(context.filesDir, "icons"), "$sha256.png")
+        if (out.isFile && out.length() > 0) return
+        if (!apkFile.isFile) {
+            android.util.Log.w(TAG, "ensureIcon: APK 不存在 ${apkFile.absolutePath}")
+            return
+        }
+        runCatching {
+            val info = pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_ACTIVITIES)
+            val appInfo = info?.applicationInfo
+            if (appInfo == null) {
+                android.util.Log.w(TAG, "ensureIcon: archive 解析失败 ${apkFile.name}")
+                return
+            }
+            cacheIcon(appInfo, apkFile, sha256)
+            android.util.Log.i(TAG, "ensureIcon: 结果 exists=${out.isFile} size=${out.length()}")
+        }.onFailure {
+            android.util.Log.w(TAG, "ensureIcon 异常: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
+    /**
+     * 提取 APK 图标并缓存到 `files/icons/<sha256>.png`（144×144）。
+     *
+     * 未安装的 APK 想取图标，必须先把 [ApplicationInfo.sourceDir] /
+     * `publicSourceDir` 指向 APK 路径，否则 `getResourcesForApplication` 会失败。
+     * 全程静默失败：图标只是展示用，不能影响解析主流程。
+     */
+    private fun cacheIcon(appInfo: ApplicationInfo, apkFile: File, sha256: String) {
+        runCatching {
+            val dir = File(context.filesDir, "icons").apply { mkdirs() }
+            val out = File(dir, "$sha256.png")
+            if (out.isFile && out.length() > 0) return
+
+            appInfo.sourceDir = apkFile.absolutePath
+            appInfo.publicSourceDir = apkFile.absolutePath
+
+            // 未安装 APK 取图标：loadIcon(pm) 是官方推荐做法（内部读 archive 资源）；
+            // 拿不到再退回按资源 id 解。
+            val drawable: Drawable = runCatching { appInfo.loadIcon(pm) }.getOrNull()
+                ?: runCatching {
+                    val res = pm.getResourcesForApplication(appInfo)
+                    if (appInfo.icon != 0) res.getDrawableForDensity(appInfo.icon, 480, null) else null
+                }.getOrNull()
+                ?: run {
+                    android.util.Log.w(TAG, "cacheIcon: 无可用 drawable pkg=${appInfo.packageName}")
+                    return
+                }
+
+            val w = drawable.intrinsicWidth.coerceIn(1, 1024)
+            val h = drawable.intrinsicHeight.coerceIn(1, 1024)
+            val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            drawable.setBounds(0, 0, w, h)
+            drawable.draw(Canvas(bitmap))
+            val scaled = Bitmap.createScaledBitmap(bitmap, 144, 144, true)
+            out.outputStream().use { scaled.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            if (scaled !== bitmap) scaled.recycle()
+            bitmap.recycle()
+        }.onFailure {
+            android.util.Log.w(TAG, "cacheIcon 异常: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
     private fun protectionLevelText(level: Int): String = when (level and PROTECTION_BASE_MASK) {
         PROTECTION_NORMAL -> "normal"
         PROTECTION_DANGEROUS -> "dangerous"
@@ -246,6 +319,7 @@ class ApkAnalyzer(private val context: Context) {
     }
 
     private companion object {
+        const val TAG = "adv/ApkAnalyzer"
         const val PROTECTION_BASE_MASK = 0xF
         const val PROTECTION_NORMAL = 0
         const val PROTECTION_DANGEROUS = 1

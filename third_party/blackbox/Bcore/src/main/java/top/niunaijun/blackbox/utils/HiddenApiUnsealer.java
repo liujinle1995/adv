@@ -1,6 +1,7 @@
 package top.niunaijun.blackbox.utils;
 
 import android.content.Context;
+import android.os.Build;
 import android.system.Os;
 
 import java.io.File;
@@ -66,6 +67,7 @@ public final class HiddenApiUnsealer {
             if (sDone) {
                 return true;
             }
+            cleanOrphanDexFiles(context);
             if (isUnsealed()) {
                 Slog.i(TAG, "hidden API 已可访问，无需豁免");
                 sDone = true;
@@ -86,12 +88,21 @@ public final class HiddenApiUnsealer {
                 return true;
             }
 
-            // 兜底：仍走一次上游实现（Android 13 及以下通常就成功了）
+            // 兜底：仍走一次上游实现（Android 13 及以下通常就成功了）。
+            // Android 14+ 不走这条：free_reflection 会把 dex 写进 code_cache 再加载，
+            // ART 从 14 起拒绝加载可写 dex（日志刷 "Attempt to load writable dex file"），
+            // Android 15/16 更是直接把 setHiddenApiExemptions 列进 blocked，
+            // 跑一遍只会多丢一个可写 dex 垃圾，没有任何收益。
             Throwable third = null;
-            try {
-                me.weishu.reflection.Reflection.unseal(context);
-            } catch (Throwable t) {
-                third = t;
+            if (Build.VERSION.SDK_INT < 34) {
+                try {
+                    me.weishu.reflection.Reflection.unseal(context);
+                } catch (Throwable t) {
+                    third = t;
+                }
+            } else {
+                third = new UnsupportedOperationException(
+                        "API " + Build.VERSION.SDK_INT + " 已拒绝 setHiddenApiExemptions，跳过 free_reflection 兜底（避免可写 dex）");
             }
             if (isUnsealed()) {
                 Slog.i(TAG, "豁免成功（free_reflection）");
@@ -104,6 +115,31 @@ public final class HiddenApiUnsealer {
                     + ", readonlyCopy=" + brief(second)
                     + ", freeReflection=" + brief(third) + "）");
             return false;
+        }
+    }
+
+    /**
+     * 清理 free_reflection 遗留的孤儿 dex（形如 <毫秒时间戳>.dex）。
+     * 该库在 API < 34 的兜底路径里把 dex 写进 code_cache 后不做清理，
+     * 这些文件残留后，后续进程每次启动刷 "Attempt to load writable dex file" 警告。
+     * 只匹配纯数字文件名，绝不碰本类自己的 adv-hiddenapi-*.dex。
+     */
+    private static void cleanOrphanDexFiles(Context context) {
+        File cacheDir = context.getCodeCacheDir();
+        if (cacheDir == null) {
+            cacheDir = context.getCacheDir();
+        }
+        File[] files = cacheDir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            String name = file.getName();
+            if (file.isFile() && name.endsWith(".dex")
+                    && name.substring(0, name.length() - 4).matches("\\d{10,}")) {
+                //noinspection ResultOfMethodCallIgnored
+                file.delete();
+            }
         }
     }
 

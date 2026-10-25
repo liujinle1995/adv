@@ -11,9 +11,16 @@
 | adb | `C:\Users\94591\AppData\Local\Android\Sdk\platform-tools\adb.exe` |
 | 已连接真机 | **无**（`adb devices` 为空）→ 阶段 2 必须接一台 |
 
-本项目使用：AGP **8.7.3** / Gradle **8.11.1** / Kotlin **2.0.21** / `compileSdk 36` / `minSdk 31` / `targetSdk 37`（支持 API 31–37，即 Android 12–17）。
+本项目使用：AGP **8.13.2** / Gradle **8.13** / Kotlin **2.0.21** / `compileSdk 37` / `minSdk 31` / `targetSdk 37`（支持 API 31–37，即 Android 12–17）。
 
-> 注：`targetSdk 37` 声明支持到 Android 17，但 `compileSdk` 保持 36 —— 本机 `platforms/android-37.0` 是新版 SDK 管理器装的（package.xml 为 XML v4 schema），AGP 8.7.x 只能解析 XML v3。项目代码未使用 API 37 新 API，故用 `android-36` 编译即可。若后续升级 AGP 到能识别 `android-37.0` 的版本，可再把 `compileSdk` 提到 37。
+> **Android 17（API 37）编译说明**：本项目已升级 AGP 到 **8.13.2**，可以直接解析本机
+> `platforms/android-37.0`（新版 SDK 管理器的 XML v4 schema），因此 `compileSdk` 真正提升到
+> **37**，targetSdk 37 的编译期 API 校验与行为变更检查全部生效。
+>
+> 升级 AGP 时踩到一个路径坑：AGP 8.13 的 aidl 生成器会把完整命令行写进生成文件头部注释，
+> 本项目路径含 `\blackbox\core\system\user\`，其中 **`\user`** 会被 javac 当作 Unicode 转义
+> （`\u` + `ser`）从而报「非法的 Unicode 转义」。已在 `third_party/blackbox/Bcore/build.gradle`
+> 里加了编译前清洗 task（把生成文件注释中的 `\u` 改写成 `/u`），不要删除。
 
 ### 1.1 本机已实测的环境坑（重要）
 

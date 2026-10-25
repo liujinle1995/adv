@@ -90,8 +90,13 @@ public class BPackageManager extends BlackManager<IBPackageManagerService> {
     }
 
     public ProviderInfo resolveContentProvider(String authority, int flags, int userId) {
+        IBPackageManagerService service = getService();
+        if (service == null) {
+            // getService 重入保护下拿不到服务：返回 null，由 hook 回退系统原始实现
+            return null;
+        }
         try {
-            return getService().resolveContentProvider(authority, flags, userId);
+            return service.resolveContentProvider(authority, flags, userId);
         } catch (RemoteException e) {
             crash(e);
         }

@@ -29,6 +29,17 @@ class RunLogger(
     }
     private val stamp = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
+    /**
+     * 写盘缓冲。
+     *
+     * 原实现每条日志一次 `File.appendText()`（open/write/close 三次系统调用），
+     * 虚拟 App 启动时会密集打日志，这部分 IO 会挤占主线程外的调度。
+     * 改为：先进内存缓冲，由单线程在短窗口内合并成一次写；WARN/ERROR 立即落盘。
+     */
+    private val buffer = StringBuilder()
+    private val bufferLock = Any()
+    private val drainScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private val redactionRules = listOf(
         Regex(
             "(?i)(token|password|passwd|pwd|cookie|authorization|secret|sessionid|access_key)\\s*[=:]\\s*[^\\s,;&\"']+"
@@ -73,16 +84,38 @@ class RunLogger(
                 redact(message) + (throwable?.let { " | ${it.javaClass.simpleName}: ${it.message}" } ?: "")
             )
         }
+        synchronized(bufferLock) { buffer.append(line) }
+        scheduleDrain(immediate = level == Level.WARN || level == Level.ERROR)
+    }
+
+    /** 调度一次落盘；短窗口内多次调用会被合并（drainScheduled 去重）。 */
+    private fun scheduleDrain(immediate: Boolean) {
+        if (!drainScheduled.compareAndSet(false, true)) return
         executor.execute {
             runCatching {
-                if (!logDir.exists()) logDir.mkdirs()
-                val file = currentLogFile()
-                rotateIfNeeded(file)
-                file.appendText(line)
+                if (!immediate) Thread.sleep(DRAIN_WINDOW_MS)
+                drain()
+            }
+            drainScheduled.set(false)
+            // 落盘期间又有新日志进来：补一次，避免缓冲区滞留
+            if (synchronized(bufferLock) { buffer.isNotEmpty() }) {
+                scheduleDrain(immediate = false)
             }
         }
     }
 
+    private fun drain() {
+        val chunk = synchronized(bufferLock) {
+            if (buffer.isEmpty()) return
+            val s = buffer.toString()
+            buffer.setLength(0)
+            s
+        }
+        if (!logDir.exists()) logDir.mkdirs()
+        val file = currentLogFile()
+        rotateIfNeeded(file)
+        file.appendText(chunk)
+    }
     fun debug(tag: String, message: String) = log(Level.DEBUG, tag, message)
     fun info(tag: String, message: String) = log(Level.INFO, tag, message)
     fun warn(tag: String, message: String, throwable: Throwable? = null) = log(Level.WARN, tag, message, throwable)
@@ -93,8 +126,17 @@ class RunLogger(
     fun latestLogFile(): File? =
         logDir.listFiles { f -> f.isFile && f.extension == "log" }?.maxByOrNull { it.lastModified() }
 
+    /** 立即落盘（导出诊断前调用，保证攒批窗口内的日志也进文件）。 */
+    fun flush() {
+        runCatching {
+            executor.submit { drain() }.get(2, TimeUnit.SECONDS)
+        }
+    }
+
     fun flushAndShutdown() {
         runCatching {
+            // 先把缓冲区剩余内容落盘，再关线程池
+            executor.execute { runCatching { drain() } }
             executor.shutdown()
             executor.awaitTermination(2, TimeUnit.SECONDS)
         }
@@ -117,5 +159,8 @@ class RunLogger(
     private companion object {
         const val MAX_BYTES = 2L * 1024 * 1024
         const val MAX_FILES = 10
+
+        /** 攒批窗口：普通日志在此窗口内的多条合并成一次写盘。 */
+        const val DRAIN_WINDOW_MS = 200L
     }
 }

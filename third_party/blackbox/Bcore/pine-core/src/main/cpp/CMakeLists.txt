@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.4.1)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both")
+# max-page-size=16384：Android 15+ 的 16KB 内存页设备（Android 17 新机型标配）
+# 要求 ELF LOAD 段 16KB 对齐，否则 libpine.so 无法 dlopen。
+set(LINKER_FLAGS "-ffixed-x18 -Wl,--hash-style=both -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_STATIC_LINKER_FLAGS "${CMAKE_STATIC_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")

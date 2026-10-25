@@ -1,7 +1,7 @@
 // 阶段 2 骨架：单模块 + BlackBox 引擎（第三方，见 third_party/blackbox）
 // 阶段 3 再按 docs/02-architecture.md 拆分自有代码的多模块
 plugins {
-    id("com.android.application") version "8.7.3" apply false
+    id("com.android.application") version "8.13.2" apply false
     id("com.android.library") version "8.7.3" apply false
     id("org.jetbrains.kotlin.android") version "2.0.21" apply false
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false

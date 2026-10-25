@@ -1,11 +1,65 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 虚拟 App 与宿主同 UID，因此宿主必须声明 INTERNET，沙箱内应用才能联网 -->
+    <!--
+      ADV 是虚拟化容器：虚拟 App 与宿主同 UID 运行，权限校验最终落在宿主进程上。
+      Android 只承认宿主在清单里声明过的权限，因此宿主必须代为声明虚拟 App
+      可能用到的权限，否则沙箱内应用申请/检查权限会直接失败。
+    -->
+
+    <!-- 网络：虚拟 App 联网、网络状态查询 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!--
+      Android 17（API 37）起新增的运行时权限：访问局域网设备（投屏、智能家居、
+      DLNA 等）必须持有该权限，否则 targetSdk 37 的应用会被系统拒绝。
+      虚拟 App 在 API 37 上使用局域网能力时依赖宿主声明此权限。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
     <!-- 悬浮返回按钮：显示在目标 App 之上（需要用户在系统设置中手动开启） -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- 虚拟 App 的通知、震动、唤醒锁 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      引擎守护服务：把引擎进程（:black）提为前台服务，避免被 OEM 冻结器当缓存进程回收。
+      Android 14+ 必须同时声明 FOREGROUND_SERVICE_SPECIAL_USE 与 manifest 里的 subtype 属性。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- 虚拟 App 的媒体 / 相机 / 录音能力 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- 虚拟 App 读取用户媒体文件（Android 13+ 细分权限） -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+    <!-- 虚拟 App 的位置能力 -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- 引擎需要枚举系统已安装应用来建立虚拟包索引（Android 11+ 包可见性限制） -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <!-- 声明为可选，避免在无相机/麦克风的设备上被应用商店过滤 -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
 
     <application
         android:name=".AdvApp"
@@ -18,6 +72,7 @@
 
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|fontScale|density|colorMode|locale|layoutDirection"
             android:exported="true"
             android:theme="@style/Theme.AdvRunner">
             <intent-filter>

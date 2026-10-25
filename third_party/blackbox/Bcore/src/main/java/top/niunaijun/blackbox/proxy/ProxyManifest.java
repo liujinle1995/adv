@@ -19,6 +19,10 @@ public class ProxyManifest {
         return getBindProvider().equals(msg) || msg.contains("proxy_content_provider_");
     }
 
+    public static boolean isEngineProvider(String msg) {
+        return isProxy(msg) || getProxyFileProvider().equals(msg);
+    }
+
     public static String getBindProvider() {
         return BlackBoxCore.getHostPkg() + ".blackbox.SystemCallProvider";
     }

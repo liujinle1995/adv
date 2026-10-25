@@ -53,3 +53,10 @@ target_link_libraries( # Specifies the target library.
         ${log-lib}
         z
         )
+
+# Android 15 起支持 16KB 内存页设备，Android 17 时代新机型普遍为 16KB 页。
+# 这类设备要求 ELF 的 LOAD 段按 16KB 对齐（0x4000），否则 dlopen 直接失败。
+# NDK r27 默认已是 16KB，但工具链默认值可能被其他 flag 覆盖，这里显式声明。
+target_link_options(blackbox PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")

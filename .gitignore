@@ -35,3 +35,6 @@ Thumbs.db
 *.p12
 *.pem
 *.key
+
+# ---- AI 助手工作目录（会话记忆，不进仓库）----
+.workbuddy/

@@ -10,10 +10,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -22,14 +24,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.adv.runner.BuildConfig
+import com.adv.runner.data.Changelog
 
-/** 更新记录二级页。 */
+/** 更新记录二级页。数据来自 [com.adv.runner.data.Changelog]，发版时维护该文件。 */
 @Composable
 fun ChangelogScreen(state: AppState) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.safeDrawing)
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -40,22 +43,49 @@ fun ChangelogScreen(state: AppState) {
             Text("更新记录", style = MaterialTheme.typography.titleLarge)
         }
 
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("0.2.0 · 引擎接入", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                Text(
-                    "· 接入 BlackBox 引擎，支持导入 / 安装 / 启动 / 停止 / 清数据",
-                    style = MaterialTheme.typography.bodySmall
+        val currentVersionCode = BuildConfig.VERSION_CODE
+        val stale = Changelog.isStale(currentVersionCode)
+        if (stale) {
+            // 断更自检：versionCode 已 bump 但 Changelog 未追加记录时暴露出来
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer
                 )
-                Text("· 实例与运行事件改存 Room 数据库", style = MaterialTheme.typography.bodySmall)
-                Text("· 首页与设置页信息架构调整", style = MaterialTheme.typography.bodySmall)
+            ) {
+                Text(
+                    "当前版本 v${BuildConfig.VERSION_NAME}（versionCode=$currentVersionCode）" +
+                        "尚无更新记录，请维护 data/Changelog.kt",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(16.dp)
+                )
             }
         }
 
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("0.1.0 · 首个版本", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                Text("· 最小可用闭环：导入 → 建实例 → 启动", style = MaterialTheme.typography.bodySmall)
+        Changelog.entries.forEach { entry ->
+            val isCurrent = entry.versionCode == currentVersionCode
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "${entry.versionName} · ${entry.title}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium
+                        )
+                        if (isCurrent) {
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "当前版本",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                    entry.highlights.forEach { item ->
+                        Text("· $item", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             }
         }
         Spacer(Modifier.height(24.dp))
@@ -68,7 +98,6 @@ fun LicensesScreen(state: AppState) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.safeDrawing)
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)

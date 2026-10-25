@@ -31,6 +31,10 @@ public class AdvClientConfiguration extends ClientConfiguration {
 
     @Override
     public boolean isEnableDaemonService() {
-        return false;
+        // 原实现（无通知渠道 / 无图标 / Android 14+ 缺 foregroundServiceType）会抛异常，
+        // 曾把 :black 带崩，因此这里被关掉。DaemonService 已按规范重写（建渠道 + 图标 +
+        // specialUse 类型 + 失败兜底），重新启用以把 :black 提为前台服务，
+        // 避免被 OEM 冻结器当缓存进程每 45–60 秒回收一次。
+        return true;
     }
 }
