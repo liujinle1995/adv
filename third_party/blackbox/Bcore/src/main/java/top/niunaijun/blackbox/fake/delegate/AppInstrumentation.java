@@ -49,12 +49,23 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     public void injectHook() {
         try {
             Instrumentation mInstrumentation = getCurrInstrumentation();
-            if (mInstrumentation == this || checkInstrumentation(mInstrumentation))
+            top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                    "injectHook current=" + (mInstrumentation == null ? "null"
+                            : mInstrumentation.getClass().getName())
+                            + " pid=" + android.os.Process.myPid());
+            if (mInstrumentation == this || checkInstrumentation(mInstrumentation)) {
                 return;
+            }
             mBaseInstrumentation = (Instrumentation) mInstrumentation;
             BRActivityThread.get(BlackBoxCore.mainThread())._set_mInstrumentation(this);
-        } catch (Exception e) {
-            e.printStackTrace();
+            // 写入后立刻回读：字段被改名/不可写时 set 会静默失败，
+            // 结果就是系统继续用默认 Instrumentation，虚拟 Activity 根本不会被创建。
+            Instrumentation after = getCurrInstrumentation();
+            top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                    "injectHook after=" + (after == null ? "null" : after.getClass().getName()));
+        } catch (Throwable e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                    "injectHook FAIL " + e.getClass().getName() + ": " + e.getMessage());
         }
     }
 
@@ -103,6 +114,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
 
     private void checkActivity(Activity activity) {
         Log.d(TAG, "callActivityOnCreate: " + activity.getClass().getName());
+        top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                "checkActivity " + activity.getClass().getName()
+                        + " pid=" + android.os.Process.myPid());
         HackAppUtils.enableQQLogOutput(activity.getPackageName(), activity.getClassLoader());
         checkHCallback();
         HookManager.get().checkEnv(IActivityClientProxy.class);
@@ -112,6 +126,8 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         if (info.theme != 0) {
             activity.getTheme().applyStyle(info.theme, true);
         }
+        // 按目标应用自己声明的方向设置（不要在大屏上强行覆盖：
+        // 实测覆盖成 UNSPECIFIED 并不能解决黑屏，反而会让竖屏应用在平板上横屏显示）。
         ActivityManagerCompat.setActivityOrientation(activity, info.screenOrientation);
     }
 
@@ -136,14 +152,24 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
 
     @Override
     public void callApplicationOnCreate(Application app) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                "callApplicationOnCreate " + (app == null ? "null" : app.getClass().getName())
+                        + " pid=" + android.os.Process.myPid());
         checkHCallback();
         super.callApplicationOnCreate(app);
     }
 
     public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {
+        top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                "newActivity " + className + " cl=" + (cl == null ? "null" : cl.getClass().getName()));
         try {
-            return super.newActivity(cl, className, intent);
+            Activity activity = super.newActivity(cl, className, intent);
+            top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                    "newActivity ok -> " + activity.getClass().getName());
+            return activity;
         } catch (ClassNotFoundException e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Inst",
+                    "newActivity CNFE " + className + " -> base");
             return mBaseInstrumentation.newActivity(cl, className, intent);
         }
     }

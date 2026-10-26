@@ -7,6 +7,7 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 
+import top.niunaijun.blackbox.BlackBoxCore;
 import top.niunaijun.blackbox.app.BActivityThread;
 import top.niunaijun.blackbox.fake.hook.HookManager;
 import top.niunaijun.blackbox.fake.service.HCallbackProxy;
@@ -25,20 +26,70 @@ import top.niunaijun.blackbox.utils.Slog;
 public class ProxyActivity extends Activity {
     public static final String TAG = "ProxyActivity";
 
+    static {
+        // 类被加载 = 系统确实尝试实例化壳。没有这条日志说明连类都没加载。
+        top.niunaijun.blackbox.utils.DiagLog.log("Proxy",
+                "CLASS LOADED pid=" + android.os.Process.myPid());
+    }
+
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.d(TAG, "onCreate");
-        finish();
 
         HookManager.get().checkEnv(HCallbackProxy.class);
-//        HookManager.get().checkEnv(AppInstrumentation.class);
+        // Instrumentation 负责用虚拟应用的 ClassLoader 实例化 Activity 并修上下文；
+        // 不重新检查的话，注入失败后系统会用默认 Instrumentation → Activity 创建失败、整屏黑。
+        HookManager.get().checkEnv(top.niunaijun.blackbox.fake.delegate.AppInstrumentation.class);
 
-        ProxyActivityRecord record = ProxyActivityRecord.create(getIntent());
-        if (record.mTarget != null) {
-            record.mTarget.setExtrasClassLoader(BActivityThread.getApplication().getClassLoader());
-            startActivity(record.mTarget);
-            return;
+        // 这里任何一个异常都会让壳崩溃 → 虚拟应用进程被杀 → 用户看到黑屏。
+        // 所以整段都兜住，并把现场写进诊断日志。
+        try {
+            ProxyActivityRecord record = ProxyActivityRecord.create(getIntent());
+            top.niunaijun.blackbox.utils.DiagLog.log("Proxy",
+                    "BOOT pid=" + android.os.Process.myPid()
+                            + " sdk=" + android.os.Build.VERSION.SDK_INT
+                            + " target=" + (record.mTarget != null)
+                            + " info=" + (record.mActivityInfo != null)
+                            + " extras=" + extrasKeys());
+
+            if (record.mTarget == null) {
+                // 参数没解出来：壳没有可启动的目标，记录现场后退出（别停在空白壳上）
+                top.niunaijun.blackbox.utils.DiagLog.log("Proxy",
+                        "ABORT target is null, extras=" + extrasKeys());
+            } else {
+                // BActivityThread.getApplication() 取的是 ActivityThread.mInitialApplication，
+                // 在 Android 17 上部分场景（进程刚创建 / 被 hook 接管）它还是 null，
+                // 直接调用 .getClassLoader() 会 NPE，导致壳一启动就崩溃。
+                ClassLoader extrasLoader;
+                android.app.Application app = BActivityThread.getApplication();
+                if (app != null) {
+                    extrasLoader = app.getClassLoader();
+                } else if (BlackBoxCore.getContext() != null) {
+                    extrasLoader = BlackBoxCore.getContext().getClassLoader();
+                } else {
+                    extrasLoader = getClassLoader();
+                }
+                record.mTarget.setExtrasClassLoader(extrasLoader);
+                startActivity(record.mTarget);
+                top.niunaijun.blackbox.utils.DiagLog.log("Proxy",
+                        "start ok -> " + record.mTarget.getComponent());
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Proxy",
+                    "THROW " + t.getClass().getName() + ": " + t.getMessage()
+                            + "\n" + Log.getStackTraceString(t));
+        }
+        finish();
+    }
+
+    /** 只取 key 集合，不打印值（值可能是大对象，且涉及用户数据）。 */
+    private String extrasKeys() {
+        try {
+            Bundle extras = getIntent() == null ? null : getIntent().getExtras();
+            return extras == null ? "none" : extras.keySet().toString();
+        } catch (Throwable t) {
+            return "err:" + t.getClass().getSimpleName();
         }
     }
 

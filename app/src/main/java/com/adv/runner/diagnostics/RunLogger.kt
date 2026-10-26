@@ -123,6 +123,15 @@ class RunLogger(
         log(Level.ERROR, tag, message, throwable)
 
     /** 最近一次日志文件；诊断页展示与导出用。 */
+    /**
+     * 读最近 [maxLines] 行，给应用内日志查看用。
+     * 只读当前最新的一个文件，避免日志量大时全量扫描。
+     */
+    fun recentLines(maxLines: Int = 300): List<String> {
+        val file = latestLogFile() ?: return emptyList()
+        return runCatching { file.readLines().takeLast(maxLines) }.getOrDefault(emptyList())
+    }
+
     fun latestLogFile(): File? =
         logDir.listFiles { f -> f.isFile && f.extension == "log" }?.maxByOrNull { it.lastModified() }
 

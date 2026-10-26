@@ -64,6 +64,8 @@ class AppState(
     val deviceSdk: Int,
     private val scope: CoroutineScope,
     val debugApkPath: String? = null,
+    /** 调试入口：启动时直接拉起该包名的已有实例。 */
+    val debugLaunchPkg: String? = null,
     private val migrator: LegacyMigrator? = null
 ) {
 
@@ -167,6 +169,62 @@ class AppState(
         }
         // 通知 UI 重新读取图标（文件是新写出来的，不触发重组会一直显示占位图）
         iconEpoch++
+    }
+
+    /* ---------------- 引擎日志（供诊断页查看） ---------------- */
+
+    /** 最近若干行运行日志（含引擎侧打点）。 */
+    var engineLog by mutableStateOf<List<String>>(emptyList())
+        private set
+
+    /**
+     * 读一次引擎日志。
+     *
+     * 优先读 `logs/engine-*.log`——那是引擎在**虚拟应用进程**里自己写的文件
+     * （静态回调跨进程不共享，只能靠文件）。没有该文件时退回宿主自己的运行日志。
+     */
+    suspend fun loadEngineLog() {
+        engineLog = withContext(Dispatchers.IO) {
+            val latest = collectEngineLogFiles().maxByOrNull { it.lastModified() }
+            val lines = latest
+                ?.let { runCatching { it.readLines().takeLast(120) }.getOrDefault(emptyList()) }
+                .orEmpty()
+            if (lines.isNotEmpty()) lines else logger.recentLines(120)
+        }
+    }
+
+    /**
+     * 收集引擎日志文件。
+     *
+     * 引擎跑在虚拟应用进程，它的 uid 与宿主不同，写盘位置可能是：
+     * - 宿主外部私有目录（最理想，adb 可直接拉）
+     * - 虚拟应用自己的私有数据目录 `<dataDir>/blackbox/data/user/<uid>/<pkg>/files/logs`
+     *
+     * 所以这里把三处都扫一遍，避免「日志写了但用户看不到」。
+     */
+    internal fun collectEngineLogFiles(): List<File> {
+        val result = mutableListOf<File>()
+        fun scan(dir: File?) {
+            if (dir == null || !dir.isDirectory) return
+            runCatching {
+                dir.listFiles { f -> f.isFile && f.name.startsWith("engine-") && f.name.endsWith(".log") }
+            }.getOrNull()?.let { result.addAll(it) }
+        }
+
+        scan(context.getExternalFilesDir("logs"))
+        scan(File(context.filesDir, "logs"))
+
+        // 虚拟应用数据目录（BlackBox 把虚拟应用的数据放在宿主 dataDir 下的 blackbox 里）
+        val blackboxRoot = File(context.filesDir.parentFile, "blackbox")
+        if (blackboxRoot.isDirectory) {
+            runCatching {
+                blackboxRoot.walkTopDown()
+                    .maxDepth(9)
+                    .filter { it.isFile && it.name.startsWith("engine-") && it.name.endsWith(".log") }
+                    .forEach { result.add(it) }
+            }
+        }
+        return result
     }
 
     /** 图标缓存版本号：回填完成 +1，触发列表重新读取图标文件。 */
@@ -901,6 +959,13 @@ class AppState(
                         log.inputStream().use { it.copyTo(zip) }
                         zip.closeEntry()
                     }
+                    // 引擎在虚拟应用进程里写的日志：每个文件单独入包，用工程名区分来源
+                    collectEngineLogFiles().forEachIndexed { index, log ->
+                        val entryName = "engine/${index}-${log.parentFile?.name ?: "log"}-${log.name}"
+                        zip.putNextEntry(java.util.zip.ZipEntry(entryName))
+                        log.inputStream().use { it.copyTo(zip) }
+                        zip.closeEntry()
+                    }
                     // 2. 设备信息
                     val deviceInfo = buildString {
                         appendLine("deviceSdk=$deviceSdk")
@@ -971,6 +1036,27 @@ class AppState(
     }
 
     /** adb 调试入口：解析 → 安装 → 启动 一条龙，必须在 [initialize] 完成后调用。 */
+    /** 调试入口：按包名直接启动已有实例，免去 UI 点击（真机自动化验证用）。 */
+    suspend fun debugLaunchPackage(pkg: String) {
+        // 实例列表可能还在加载，轮询等一会
+        var instance = instances.firstOrNull { it.packageName == pkg }
+        var waited = 0
+        while (instance == null && waited < 6000) {
+            kotlinx.coroutines.delay(300)
+            waited += 300
+            instance = instances.firstOrNull { it.packageName == pkg }
+        }
+        top.niunaijun.blackbox.utils.DiagLog.log("debug",
+                "launch pkg=" + pkg + " found=" + (instance != null)
+                        + " known=" + instances.joinToString(",") { it.packageName })
+        if (instance == null) {
+            status = "调试启动失败：未找到 $pkg 的实例"
+            return
+        }
+        status = "调试启动：${instance.displayName}"
+        launch(instance.id)
+    }
+
     suspend fun debugAutoRun(path: String) {
         val file = File(path)
         if (!file.isFile) {

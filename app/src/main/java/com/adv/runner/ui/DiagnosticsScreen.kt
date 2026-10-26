@@ -29,12 +29,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.adv.runner.diagnostics.RunLogger
+import androidx.compose.runtime.LaunchedEffect
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
 /** 诊断二级页：引擎自检 + 日志级别切换 + 导出诊断包。 */
 @Composable
 fun DiagnosticsScreen(state: AppState, scope: CoroutineScope) {
+    // 进页面读一次日志；部分 ROM 限制了系统 logcat，引擎侧打点只能在这里看
+    LaunchedEffect(Unit) { state.loadEngineLog() }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -72,6 +75,32 @@ fun DiagnosticsScreen(state: AppState, scope: CoroutineScope) {
                             color = if (item.passed) MaterialTheme.colorScheme.onSurfaceVariant
                             else MaterialTheme.colorScheme.error
                         )
+                    }
+                }
+            }
+        }
+
+        // 引擎日志
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("引擎日志", fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.weight(1f))
+                    OutlinedButton(onClick = { scope.launch { state.loadEngineLog() } }) { Text("刷新") }
+                }
+                if (state.engineLog.isEmpty()) {
+                    Text(
+                        "暂无日志。启动一次虚拟应用后再点刷新，这里会显示引擎侧的 Activity 启动与窗口添加记录。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    Text(
+                        "最近 ${state.engineLog.size} 行",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    state.engineLog.forEach { line ->
+                        Text(line, style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }

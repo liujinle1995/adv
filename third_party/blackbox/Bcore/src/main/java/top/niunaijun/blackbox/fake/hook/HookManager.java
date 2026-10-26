@@ -179,8 +179,15 @@ public class HookManager {
             try {
                 Slog.d(TAG, "hook: " + value);
                 value.injectHook();
-            } catch (Exception e) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Hook",
+                        "ok " + value.getClass().getSimpleName() + " pid=" + android.os.Process.myPid());
+            } catch (Throwable e) {
                 Slog.d(TAG, "hook error: " + value);
+                // 单个 hook 注入失败会被静默忽略，但它是"虚拟界面起不来"的常见根因，
+                // 这里必须留证据。
+                top.niunaijun.blackbox.utils.DiagLog.log("Hook",
+                        "FAIL " + value.getClass().getSimpleName() + " : "
+                                + e.getClass().getName() + ": " + e.getMessage());
             }
         }
     }

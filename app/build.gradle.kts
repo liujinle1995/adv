@@ -18,8 +18,8 @@ android {
         // 需求：最低支持 Android 12（API 31），最高支持 Android 17（API 37）
         minSdk = 31
         targetSdk = 37
-        versionCode = 17
-        versionName = "0.4.1"
+        versionCode = 47
+        versionName = "0.7.3"
 
         ndk {
             // 目标设备（realme RMX3888 / Android 16）无 32 位运行时
@@ -121,4 +121,46 @@ tasks.register("checkChangelogVersion") {
 
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn("checkChangelogVersion")
+}
+
+// ---------------------------------------------------------------------------
+// 构建产物分发：每次 assembleRelease 之后，把正式版 APK 复制到 Z 盘归档目录。
+//
+// 需求来自用户：正式版构建完成后自动留一份到 Z:/应用虚幻器。
+// 用 finalizedBy 挂在 assembleRelease 后面，任何人执行构建都会触发，不依赖 IDE/脚本。
+// Z 盘是外接/网络盘，可能临时不可用 —— 所有失败只告警，绝不让构建失败。
+// ---------------------------------------------------------------------------
+tasks.register("copyReleaseApkToZ") {
+    group = "distribution"
+    description = "把正式版 APK 复制到 Z:/应用虚幻器"
+
+    val srcProvider = layout.buildDirectory.file("outputs/apk/release/app-release.apk")
+    val versionName = android.defaultConfig.versionName ?: "unknown"
+    val destDir = File("Z:/应用虚幻器")
+
+    doLast {
+        val src = srcProvider.get().asFile
+        if (!src.isFile) {
+            logger.warn("⚠ 未找到正式版 APK，跳过归档：${src.absolutePath}")
+            return@doLast
+        }
+        if (!destDir.isDirectory) {
+            logger.warn("⚠ 归档目录不存在，跳过：${destDir.absolutePath}")
+            return@doLast
+        }
+        val dest = File(destDir, "应用虚幻器-v$versionName-release.apk")
+        runCatching { src.copyTo(dest, overwrite = true) }
+            .onSuccess {
+                logger.lifecycle(
+                    "✅ 正式版已归档：${dest.absolutePath}（${dest.length() / 1024 / 1024} MB）"
+                )
+            }
+            .onFailure {
+                logger.warn("⚠ 复制到 Z 盘失败（不影响构建结果）：${it.message}")
+            }
+    }
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy("copyReleaseApkToZ")
 }

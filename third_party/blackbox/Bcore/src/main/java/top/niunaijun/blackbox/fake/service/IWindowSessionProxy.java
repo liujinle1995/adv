@@ -53,15 +53,31 @@ public class IWindowSessionProxy extends BinderInvocationStub {
     public static class AddToDisplay extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            String desc = "";
             for (Object arg : args) {
                 if (arg == null) {
                     continue;
                 }
                 if (arg instanceof WindowManager.LayoutParams) {
-                    ((WindowManager.LayoutParams) arg).packageName = BlackBoxCore.getHostPkg();
+                    WindowManager.LayoutParams lp = (WindowManager.LayoutParams) arg;
+                    desc = "type=" + lp.type + " w=" + lp.width + " h=" + lp.height
+                            + " token=" + (lp.token != null) + " title=" + lp.getTitle();
+                    lp.packageName = BlackBoxCore.getHostPkg();
                 }
             }
-            return method.invoke(who, args);
+            // addToDisplay 的返回值就是 WMS 的状态码：0 表示窗口添加成功，负数表示被拒。
+            // 这是判断"窗口为什么 0x0 / 没有 surface"最直接的证据。
+            try {
+                Object result = method.invoke(who, args);
+                top.niunaijun.blackbox.utils.DiagLog.log(
+                        "WMS", "addToDisplay -> " + result + " | " + desc);
+                return result;
+            } catch (Throwable t) {
+                top.niunaijun.blackbox.utils.DiagLog.log(
+                        "WMS", "addToDisplay THROW " + t.getClass().getSimpleName()
+                                + ":" + t.getMessage() + " | " + desc);
+                throw t;
+            }
         }
     }
 

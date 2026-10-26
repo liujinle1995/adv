@@ -57,6 +57,11 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val state = remember {
                         val logger = RunLogger(File(appContext.filesDir, "logs"))
+                        // 系统 logcat 在部分 ROM（荣耀平板等）上几乎为空，
+                        // 把引擎关键路径日志转到本地文件，供应用内诊断页查看。
+                        top.niunaijun.blackbox.utils.DiagLog.install { tag, message ->
+                            logger.info("engine/$tag", message)
+                        }
                         val engine = BlackBoxEngineAdapter(logger)
                         val db = DatabaseProvider.get(appContext)
                         val store = InstanceRepository(db)
@@ -78,7 +83,8 @@ class MainActivity : ComponentActivity() {
                             deviceAbis = Build.SUPPORTED_ABIS.toList(),
                             deviceSdk = Build.VERSION.SDK_INT,
                             scope = (appContext as AdvApp).appScope,
-                            debugApkPath = intent?.getStringExtra(EXTRA_DEBUG_APK)
+                            debugApkPath = intent?.getStringExtra(EXTRA_DEBUG_APK),
+                            debugLaunchPkg = intent?.getStringExtra(EXTRA_DEBUG_LAUNCH)
                         )
                     }
                     AppRoot(state)
@@ -96,5 +102,13 @@ class MainActivity : ComponentActivity() {
          *     --es debug_apk /sdcard/Android/data/com.adv.runner/files/base.apk
          */
         const val EXTRA_DEBUG_APK = "debug_apk"
+
+        /**
+         * 调试入口：直接启动已存在的实例（省掉 UI 点击），用于真机自动化验证：
+         *
+         * adb shell am start -n com.adv.runner/.MainActivity \
+         *     --es debug_launch com.phoenix.read
+         */
+        const val EXTRA_DEBUG_LAUNCH = "debug_launch"
     }
 }

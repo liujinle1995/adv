@@ -199,6 +199,18 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
     }
 
+    /** 供诊断使用：当前进程里加载虚拟应用类的 ClassLoader（取不到返回 null）。 */
+    public ClassLoader getClassLoaderForApp() {
+        try {
+            if (mBoundApplication == null || mBoundApplication.info == null) {
+                return null;
+            }
+            return BRLoadedApk.get(mBoundApplication.info).getClassLoader();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     public boolean isInit() {
         return mBoundApplication != null;
     }
@@ -316,10 +328,16 @@ public class BActivityThread extends IBActivityThread.Stub {
         Object boundApplication = BRActivityThread.get(BlackBoxCore.mainThread()).mBoundApplication();
 
         Context packageContext = createPackageContext(applicationInfo);
-        Object loadedApk = BRContextImpl.get(packageContext).mPackageInfo();
+        Object loadedApk = resolveLoadedApk(applicationInfo, packageContext);
+        top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                "pkg=" + packageName
+                        + " ctxPkg=" + (packageContext == null ? "null" : packageContext.getPackageName())
+                        + " apkPkg=" + loadedApkPackageName(loadedApk));
+        diagLoadedApk(loadedApk, applicationInfo);
         BRLoadedApk.get(loadedApk)._set_mSecurityViolation(false);
         // fix applicationInfo
         BRLoadedApk.get(loadedApk)._set_mApplicationInfo(applicationInfo);
+        step("fixed appInfo");
 
         int targetSdkVersion = applicationInfo.targetSdkVersion;
         if (targetSdkVersion < Build.VERSION_CODES.GINGERBREAD) {
@@ -336,6 +354,7 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
 
         VirtualRuntime.setupRuntime(processName, applicationInfo);
+        step("VirtualRuntime");
 
         BRVMRuntime.get(BRVMRuntime.get().getRuntime()).setTargetSdkVersion(applicationInfo.targetSdkVersion);
         if (BuildCompat.isS()) {
@@ -343,8 +362,10 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
 
         NativeCore.init(Build.VERSION.SDK_INT);
+        step("NativeCore");
         assert packageContext != null;
         IOCore.get().enableRedirect(packageContext);
+        step("IOCore");
 
         AppBindData bindData = new AppBindData();
         bindData.appInfo = applicationInfo;
@@ -360,6 +381,7 @@ public class BActivityThread extends IBActivityThread.Stub {
         activityThreadAppBindData._set_providers(bindData.providers);
 
         mBoundApplication = bindData;
+        step("appBindData");
 
         //ssl适配
         if (BRNetworkSecurityConfigProvider.getRealClass() != null) {
@@ -369,26 +391,58 @@ public class BActivityThread extends IBActivityThread.Stub {
         Application application;
         try {
             onBeforeCreateApplication(packageName, processName, packageContext);
+            step("onBeforeCreateApplication");
             // 用 Reflector 而不是 BlackReflection：后者的 get() 会把异常吞成 null，
             // makeApplication 一旦失败只会得到一个莫名的 NPE（ContextCompat.fix(null)），
             // 真实原因（LoadedApk/Instrumentation 在 Android 14+ 的变化）完全看不到。
             application = Reflector.with(loadedApk)
                     .method("makeApplication", boolean.class, Instrumentation.class)
                     .call(false, null);
+            step("makeApplication -> " + (application == null ? "null" : application.getClass().getName()));
             mInitialApplication = application;
             BRActivityThread.get(BlackBoxCore.mainThread())._set_mInitialApplication(mInitialApplication);
             ContextCompat.fix((Context) BRActivityThread.get(BlackBoxCore.mainThread()).getSystemContext());
             ContextCompat.fix(mInitialApplication);
             installProviders(mInitialApplication, bindData.processName, bindData.providers);
+            step("installProviders");
 
             onBeforeApplicationOnCreate(packageName, processName, application);
             AppInstrumentation.get().callApplicationOnCreate(application);
+            step("callApplicationOnCreate");
             onAfterApplicationOnCreate(packageName, processName, application);
 
             HookManager.get().checkEnv(HCallbackProxy.class);
-        } catch (Exception e) {
+            step("checkEnv HCallbackProxy");
+        } catch (Throwable e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                    "EXCEPTION " + e.getClass().getName() + ": " + e.getMessage());
             e.printStackTrace();
             throw new RuntimeException("Unable to makeApplication", e);
+        }
+    }
+
+    private static void step(String name) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Bind", "step " + name);
+    }
+
+    /** 确认 LoadedApk 的 ClassLoader 能否真正加载虚拟应用的 Application 类。 */
+    private static void diagLoadedApk(Object loadedApk, ApplicationInfo applicationInfo) {
+        try {
+            ClassLoader cl = BRLoadedApk.get(loadedApk).getClassLoader();
+            StringBuilder sb = new StringBuilder("ldr=")
+                    .append(cl == null ? "null" : cl.getClass().getName())
+                    .append(" appCls=").append(applicationInfo.className);
+            if (cl != null && applicationInfo.className != null) {
+                try {
+                    cl.loadClass(applicationInfo.className);
+                    sb.append(" load=OK");
+                } catch (Throwable t) {
+                    sb.append(" load=FAIL ").append(t.getClass().getSimpleName());
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind", sb.toString());
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind", "diagLoadedApk ERR " + t);
         }
     }
 
@@ -402,6 +456,56 @@ public class BActivityThread extends IBActivityThread.Stub {
                 FileUtils.makeReadOnly(split);
             }
         }
+    }
+
+    /**
+     * 取虚拟应用自己的 LoadedApk。
+     *
+     * 不能直接用 createPackageContext 拿到的那个：宿主里没有虚拟应用的包记录时，
+     * 它返回的是**宿主自己的 LoadedApk**，其 mApplication 已经是宿主的 Application。
+     * 这样 makeApplication() 会直接返回缓存的宿主 Application，
+     * 虚拟应用的 Application 永远不会被创建 —— 后续系统创建界面时拿不到应用上下文，
+     * 界面就一直出不来。
+     *
+     * 改用系统自己在 performLaunchActivity 里用的入口 getPackageInfoNoCheck：
+     * 它以 ApplicationInfo.packageName 为 key 建/取 LoadedApk，
+     * 拿到的是加载虚拟 APK 的那一份。
+     */
+    private static Object resolveLoadedApk(ApplicationInfo applicationInfo, Context packageContext) {
+        Object fromSystem = null;
+        try {
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            Class<?> compatCls = Class.forName("android.content.res.CompatibilityInfo");
+            Object compat = compatCls.getField("DEFAULT_COMPATIBILITY_INFO").get(null);
+            java.lang.reflect.Method m = atCls.getDeclaredMethod(
+                    "getPackageInfoNoCheck", ApplicationInfo.class, compatCls);
+            m.setAccessible(true);
+            Object receiver = java.lang.reflect.Modifier.isStatic(m.getModifiers())
+                    ? null : BlackBoxCore.mainThread();
+            fromSystem = m.invoke(receiver, applicationInfo, compat);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                    "getPackageInfoNoCheck FAIL " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+        if (fromSystem != null && applicationInfo.packageName.equals(loadedApkPackageName(fromSystem))) {
+            return fromSystem;
+        }
+        // 回退：老路子（可能拿到宿主的 LoadedApk，仅作兜底）
+        top.niunaijun.blackbox.utils.DiagLog.log("Bind", "fallback to context loadedApk");
+        return BRContextImpl.get(packageContext).mPackageInfo();
+    }
+
+    /** 读取 LoadedApk 的包名，用于确认拿到的到底是谁的那一份。 */
+    private static String loadedApkPackageName(Object loadedApk) {
+        if (loadedApk == null) {
+            return "null";
+        }
+        try {
+            Object info = loadedApk.getClass().getMethod("getApplicationInfo").invoke(loadedApk);
+            return info == null ? "unknown" : ((ApplicationInfo) info).packageName;
+        } catch (Throwable ignored) {
+        }
+        return "unknown";
     }
 
     public static Context createPackageContext(ApplicationInfo info) {

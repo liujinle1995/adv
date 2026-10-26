@@ -8,6 +8,8 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
 import android.content.res.TypedArray;
+import android.graphics.Rect;
+import android.util.DisplayMetrics;
 import android.os.Binder;
 import android.os.Bundle;
 import android.os.Handler;
@@ -287,11 +289,24 @@ public class ActivityStack {
         ActivityRecord record = newActivityRecord(intent, activityInfo, resultTo, userId);
         Intent shadow = startActivityProcess(userId, intent, activityInfo, record);
 
-        shadow.addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        shadow.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT);
+        // 只保留 NEW_TASK。
+        //
+        // 原来还加了 MULTIPLE_TASK + NEW_DOCUMENT，这两个组合会让系统把虚拟 Activity
+        // 当成"文档任务/应用多开"。在平板（荣耀 MagicOS、三星 One UI 等）上，
+        // 这类任务会被放进 **自由窗口（freeform）**：窗口能创建，但 DecorView 不可见、
+        // 没有 surface，用户在 Android 17 平板上看到的就是全黑屏
+        // （dumpsys 表现为 mViewVisibility=0x8 / mHasSurface=false / windowingMode=freeform）。
         shadow.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         shadow.addFlags(launchMode);
 
+        top.niunaijun.blackbox.utils.DiagLog.log("AM",
+                "newTask " + intent.getComponent() + " launchMode=" + launchMode
+                        + " flags=0x" + Integer.toHexString(shadow.getFlags()));
+
+        // 不要附带任何 ActivityOptions / launch bounds：
+        // 在窗口化的桌面模式（freeform）下，给新任务指定 bounds 会让系统按固定尺寸
+        // 建窗口，实测会导致 Activity 根本没有被创建（ActivityRecord 是 RESUMED，
+        // 但 windows 为空、界面不出现）。交回系统默认的窗口决策才安全。
         BlackBoxCore.getContext().startActivity(shadow);
         return 0;
     }
@@ -300,6 +315,10 @@ public class ActivityStack {
                                           IBinder resultTo, String resultWho, int requestCode, int flags,
                                           Bundle options,
                                           int userId, ActivityRecord sourceRecord, ActivityInfo activityInfo, int launchMode) {
+        top.niunaijun.blackbox.utils.DiagLog.log("AM",
+                "sourceTask " + intent.getComponent() + " resultTo=" + (resultTo != null)
+                        + " flags=0x" + Integer.toHexString(flags)
+                        + " requestCode=" + requestCode);
         ActivityRecord selfRecord = newActivityRecord(intent, activityInfo, resultTo, userId);
         Intent shadow = startActivityProcess(userId, intent, activityInfo, selfRecord);
         shadow.setAction(UUID.randomUUID().toString());

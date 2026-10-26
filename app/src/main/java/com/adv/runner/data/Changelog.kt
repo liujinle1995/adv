@@ -21,6 +21,281 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 47,
+            versionName = "0.7.3",
+            title = "绕过外部存储卡死",
+            highlights = listOf(
+                "启动阶段不再触发外部存储访问，避免主线程被系统授权流程挂住",
+                "先保证启动链路能完整走通，外部存储重定向后续单独处理",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 46,
+            versionName = "0.7.2",
+            title = "继续细分启动卡点",
+            highlights = listOf(
+                "启动过程中的目录准备与规则注册分别记录",
+                "用于确认剩余阻塞点落在创建目录还是注册重定向规则",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 45,
+            versionName = "0.7.1",
+            title = "修复启动主线程卡死",
+            highlights = listOf(
+                "修复虚拟应用启动时主线程永久挂住的问题",
+                "不再在虚拟进程里查询系统外部存储路径",
+                "这一处卡死正是启动流程走不到界面的直接原因",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 44,
+            versionName = "0.7.0",
+            title = "继续追启动卡点",
+            highlights = listOf(
+                "原生崩溃已解决，进程可以稳定存活",
+                "启动流程记录细到路径重定向各阶段，定位剩余卡点",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 43,
+            versionName = "0.6.9",
+            title = "修复启动时的原生崩溃",
+            highlights = listOf(
+                "修复虚拟应用启动到一半进程直接消失的问题",
+                "新系统上部分内部接口已不可用，取不到时改为安全降级而不是崩溃",
+                "这是黑屏真正的原因：进程在创建应用上下文时就被打死了",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 42,
+            versionName = "0.6.8",
+            title = "启动链路全程定位",
+            highlights = listOf(
+                "启动流程改为逐步记录，可精确定位卡在哪个环节",
+                "补齐应用上下文加载器与实际 Application 类的可用性检测",
+                "异常不再静默，直接写入诊断日志",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 41,
+            versionName = "0.6.7",
+            title = "修复应用上下文创建",
+            highlights = listOf(
+                "修复虚拟应用的应用上下文从未被创建的问题",
+                "改用系统自身入口获取虚拟应用的包信息，不再误用宿主的那一份",
+                "这是界面无法创建的根因所在",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 40,
+            versionName = "0.6.6",
+            title = "停止重启循环",
+            highlights = listOf(
+                "移除会引发进程反复重启的诊断调用，启动流程恢复稳定",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 39,
+            versionName = "0.6.5",
+            title = "回退事务直执行",
+            highlights = listOf(
+                "移除直接执行启动事务的做法，避免触发进程重启循环",
+                "保留启动前置检查的诊断记录",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 38,
+            versionName = "0.6.4",
+            title = "直接执行启动事务",
+            highlights = listOf(
+                "前置检查已确认可用，改为由引擎直接把启动事务交给系统执行",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 37,
+            versionName = "0.6.3",
+            title = "绕开系统分发链",
+            highlights = listOf(
+                "启动事务直接交给系统处理，不再依赖可能被 ROM 改写的消息分发链",
+                "修正启动前的前置检查方式，避免误报",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 36,
+            versionName = "0.6.2",
+            title = "定位初始化缺失",
+            highlights = listOf(
+                "记录系统运行时的关键成员是否已初始化，定位界面创建失败的具体原因",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 35,
+            versionName = "0.6.1",
+            title = "复现创建前置步骤",
+            highlights = listOf(
+                "用系统自身入口复现界面创建的前置步骤，记录成功或失败原因",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 34,
+            versionName = "0.6.0",
+            title = "回退可疑改动",
+            highlights = listOf(
+                "去掉启动时指定的窗口尺寸，交回系统默认的窗口决策",
+                "去掉大屏强制跟随系统方向的覆盖，按应用自身声明处理",
+                "这两处是此前为修黑屏引入的，实测无效且有副作用",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 33,
+            versionName = "0.5.7",
+            title = "探测窗口会话",
+            highlights = listOf(
+                "启动前主动探测窗口会话能否建立，并记录失败原因",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 32,
+            versionName = "0.5.6",
+            title = "调试入口可用",
+            highlights = listOf(
+                "调试启动会等待实例列表就绪，并记录匹配结果",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 31,
+            versionName = "0.5.5",
+            title = "启动消息不再被吞",
+            highlights = listOf(
+                "修复系统启动消息被其他回调拦截、导致虚拟界面永远不创建的问题",
+                "记录启动消息的实际处理者，便于后续排查",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 30,
+            versionName = "0.5.4",
+            title = "追踪启动消息",
+            highlights = listOf(
+                "记录主线程消息与框架实现的实时状态，确认启动消息是否到达",
+                "记录启动壳是否被加载，区分类未加载与创建中断",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 29,
+            versionName = "0.5.3",
+            title = "验证系统创建能力",
+            highlights = listOf(
+                "改为由启动壳自行拉起虚拟界面，绕开系统侧被替换的启动参数",
+                "记录虚拟应用类的真实加载结果，确认类加载是否正常",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 28,
+            versionName = "0.5.2",
+            title = "检查启动依赖",
+            highlights = listOf(
+                "记录虚拟界面创建依赖的安装包路径与类加载结果",
+                "用于确认系统侧解析界面时缺失的是哪一项",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 27,
+            versionName = "0.5.1",
+            title = "校验框架替换",
+            highlights = listOf(
+                "注入后立刻回读实际生效的实现，确认替换是否真的发生",
+                "替换失败会被记录下来，而不是静默退回系统默认实现",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 26,
+            versionName = "0.5.0",
+            title = "记录注入结果",
+            highlights = listOf(
+                "记录每项框架注入的成败，注入失败不再被静默忽略",
+                "重新启用界面创建前的环境检查，避免落到默认实现导致界面起不来",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 25,
+            versionName = "0.4.9",
+            title = "定位虚拟界面创建",
+            highlights = listOf(
+                "在界面创建的每一步打点：实例化、上下文修正、生命周期回调",
+                "用于确认虚拟界面到底卡在创建链路的哪一步",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 24,
+            versionName = "0.4.8",
+            title = "启动链路打点",
+            highlights = listOf(
+                "记录虚拟界面被创建的唯一入口：启动参数是否被正确解析",
+                "记录进程初始化状态与重启分支，用于定位启动环节中断的位置",
+                "新增按包名直接启动实例的调试入口，便于真机自动化验证",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 23,
+            versionName = "0.4.7",
+            title = "诊断日志可读",
+            highlights = listOf(
+                "引擎日志改为多候选目录写入，虚拟进程里也能落到可读位置",
+                "诊断页与诊断包会扫描虚拟应用数据目录，不再出现日志为空的情况",
+                "启动壳的关键步骤全程兜底，异常不再导致虚拟进程直接崩溃",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 22,
+            versionName = "0.4.6",
+            title = "修复 API 37 启动崩溃",
+            highlights = listOf(
+                "修复 Android 17 上启动虚拟应用必崩的问题（Application 未就绪导致空指针）",
+                "这是此前平板黑屏的真正原因：虚拟应用进程在启动阶段就被杀掉",
+                "顺带修复 Android 13+ 读取启动参数用了废弃 API 的问题",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 21,
+            versionName = "0.4.5",
+            title = "引擎日志跨进程",
+            highlights = listOf(
+                "修复引擎日志写入失败：引擎跑在虚拟应用进程，静态回调跨进程不共享",
+                "改为由引擎直接写日志文件，诊断页按文件读取，能拿到真实现场",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 20,
+            versionName = "0.4.4",
+            title = "引擎诊断日志",
+            highlights = listOf(
+                "诊断页新增「引擎日志」：显示 Activity 启动与窗口添加的现场记录",
+                "引擎侧关键路径接入本地日志，绕开部分机型被限制的系统 logcat",
+                "记录窗口添加的返回码，可直接看出窗口是否被系统拒绝",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 19,
+            versionName = "0.4.3",
+            title = "平板黑屏修复",
+            highlights = listOf(
+                "修复锁定屏幕方向的应用（如红果）在平板上黑屏的问题",
+                "原因：应用声明的方向让系统启用 letterbox 兼容窗口，沙箱窗口在其中拿不到尺寸",
+                "大屏设备上改为跟随系统方向，虚拟界面按真实窗口全屏布局",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 18,
+            versionName = "0.4.2",
+            title = "修复 Android 17 黑屏",
+            highlights = listOf(
+                "修复在 Android 17 平板上启动虚拟应用后全黑屏、只剩悬浮按钮的问题",
+                "原因：引擎启动虚拟界面时使用了多任务标志，被系统当成“文档/多开窗口”塞进自由窗口",
+                "现在只申请单任务启动，并显式要求全屏窗口模式，兼容平板的多窗口策略",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 17,
             versionName = "0.4.1",
             title = "清理缓存",

@@ -54,9 +54,13 @@ public class IOCore {
         mRedirectMap.put(origPath, redirectPath);
         File redirectFile = new File(redirectPath);
         if (!redirectFile.exists()) {
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "mkdirs " + redirectPath);
             FileUtils.mkdirs(redirectPath);
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "mkdirs done");
         }
+        top.niunaijun.blackbox.utils.DiagLog.log("IO", "addIORule " + origPath);
         NativeCore.addIORule(origPath, redirectPath);
+        top.niunaijun.blackbox.utils.DiagLog.log("IO", "addIORule done");
     }
 
     public void addBlackRedirect(String path) {
@@ -114,31 +118,43 @@ public class IOCore {
         Map<String, String> rule = new LinkedHashMap<>();
         Set<String> blackRule = new HashSet<>();
         String packageName = context.getPackageName();
+        top.niunaijun.blackbox.utils.DiagLog.log("IO", "enter pkg=" + packageName);
 
         try {
             ApplicationInfo packageInfo = BlackBoxCore.getBPackageManager().getApplicationInfo(packageName, PackageManager.GET_META_DATA, BActivityThread.getUserId());
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "appInfo ok dataDir=" + packageInfo.dataDir
+                    + " libDir=" + packageInfo.nativeLibraryDir);
             int systemUserId = BlackBoxCore.getHostUserId();
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "hostUserId=" + systemUserId);
             rule.put(String.format("/data/data/%s/lib", packageName), packageInfo.nativeLibraryDir);
             rule.put(String.format("/data/user/%d/%s/lib", systemUserId, packageName), packageInfo.nativeLibraryDir);
 
             rule.put(String.format("/data/data/%s", packageName), packageInfo.dataDir);
             rule.put(String.format("/data/user/%d/%s", systemUserId, packageName), packageInfo.dataDir);
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "data rule ok");
 
-            if (BlackBoxCore.getContext().getExternalCacheDir() != null && context.getExternalCacheDir() != null) {
-                File external = BEnvironment.getExternalUserDir(BActivityThread.getUserId());
-
-                // sdcard
-                rule.put("/sdcard", external.getAbsolutePath());
-                rule.put(String.format("/storage/emulated/%d", systemUserId), external.getAbsolutePath());
-
-                blackRule.add("/sdcard/Pictures");
-                blackRule.add(String.format("/storage/emulated/%d/Pictures", systemUserId));
-            }
-            if (BlackBoxCore.get().isHideRoot()) {
+            // 这里**不能**调 context.getExternalCacheDir() / getExternalStorageDirectory()：
+            // :p0 进程跑在虚拟 uid 下，这类调用会走 StorageManager 的 binder，
+            // 而调用方身份此时还没切换到虚拟用户，实测在主线程上永久挂住
+            // （进程存活、CPU 0%、后续启动流程再也不动）。
+            //
+            // 同理，把 /sdcard 重定向到外部沙箱目录也会挂：规则注册前要先对目标路径
+            // 做 exists()/mkdirs()，而这条外部路径在虚拟进程里同样要走 FUSE 授权。
+            // 结论：外部存储重定向整体推迟到「进程身份完全就绪」之后再单独处理，
+            // 启动链路优先——只有先跑起来，才有机会处理这些细节。
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "skip external rules (virtual uid storage)");
+            boolean hideRoot = BlackBoxCore.get().isHideRoot();
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "rules=" + rule.size()
+                    + " black=" + blackRule.size() + " hideRoot=" + hideRoot);
+            if (hideRoot) {
                 hideRoot(rule);
+                top.niunaijun.blackbox.utils.DiagLog.log("IO", "hideRoot ok");
             }
             proc(rule);
-        } catch (Exception e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "proc ok");
+        } catch (Throwable e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("IO", "EXCEPTION " + e.getClass().getName()
+                    + ": " + e.getMessage());
             e.printStackTrace();
         }
         for (String key : rule.keySet()) {
@@ -147,7 +163,9 @@ public class IOCore {
         for (String s : blackRule) {
             get().addBlackRedirect(s);
         }
+        top.niunaijun.blackbox.utils.DiagLog.log("IO", "before enableIO");
         NativeCore.enableIO();
+        top.niunaijun.blackbox.utils.DiagLog.log("IO", "enableIO ok");
     }
 
     private void hideRoot(Map<String, String> rule) {

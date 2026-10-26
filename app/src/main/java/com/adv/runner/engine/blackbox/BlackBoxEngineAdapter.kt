@@ -84,6 +84,8 @@ class BlackBoxEngineAdapter(
                 )
             )
             capabilities = snapshot
+            // 对照打点：确认 DiagLog 的写盘通路在主进程是否可用
+            top.niunaijun.blackbox.utils.DiagLog.log("Engine", "主进程 DiagLog 通路 OK")
             logger.info(
                 TAG,
                 "引擎就绪，宿主=${BlackBoxCore.getHostPkg()} " +

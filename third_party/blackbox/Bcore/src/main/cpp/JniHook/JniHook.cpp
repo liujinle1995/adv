@@ -25,24 +25,47 @@ static struct {
 
 } HookEnv;
 
+// 这三个 getter 在 MethodUtils 不可用（Android 新版可能限制反射）时必须返回空串，
+// 而不是把 null jstring 交给 GetStringUTFChars —— 后者同样会走 JniAbort 打死进程。
 static const char *GetMethodDesc(JNIEnv *env, jobject javaMethod) {
+    if (!HookEnv.method_utils_class || !HookEnv.get_method_desc_id) {
+        return "";
+    }
     auto desc = reinterpret_cast<jstring>(env->CallStaticObjectMethod(HookEnv.method_utils_class,
                                                                       HookEnv.get_method_desc_id,
                                                                       javaMethod));
+    if (!desc) {
+        env->ExceptionClear();
+        return "";
+    }
     return env->GetStringUTFChars(desc, JNI_FALSE);
 }
 
 static const char *GetMethodDeclaringClass(JNIEnv *env, jobject javaMethod) {
+    if (!HookEnv.method_utils_class || !HookEnv.get_method_declaring_class_id) {
+        return "";
+    }
     auto desc = reinterpret_cast<jstring>(env->CallStaticObjectMethod(HookEnv.method_utils_class,
                                                                       HookEnv.get_method_declaring_class_id,
                                                                       javaMethod));
+    if (!desc) {
+        env->ExceptionClear();
+        return "";
+    }
     return env->GetStringUTFChars(desc, JNI_FALSE);
 }
 
 static const char *GetMethodName(JNIEnv *env, jobject javaMethod) {
+    if (!HookEnv.method_utils_class || !HookEnv.get_method_name_id) {
+        return "";
+    }
     auto desc = reinterpret_cast<jstring>(env->CallStaticObjectMethod(HookEnv.method_utils_class,
                                                                       HookEnv.get_method_name_id,
                                                                       javaMethod));
+    if (!desc) {
+        env->ExceptionClear();
+        return "";
+    }
     return env->GetStringUTFChars(desc, JNI_FALSE);
 }
 
@@ -77,25 +100,49 @@ inline static bool ClearFastNativeFlag(char *art_method) {
     return HookEnv.api_level < __ANDROID_API_P__ && ClearAccessFlag(art_method, kAccFastNative);
 }
 
+// 说明：以下两个转换函数在 Android 14+ 上必须能「失败但不崩」。
+// 高版本 ART 会移除/隐藏 getArtField()、Executable.artMethod 这类内部反射入口，
+// 一旦 GetMethodID/GetFieldID 返回 null 还去调 Call*Method，ART 会走
+// JavaVMExt::JniAbort 直接 SIGSEGV 打死进程（现场无 Java 崩溃栈）。
+// 拿不到就退回 jfieldID/jmethodID 原值——在 ART 里它们本身就是 ArtField*/ArtMethod*。
 static void *GetArtMethod(JNIEnv *env, jclass clazz, jmethodID methodId) {
     if (HookEnv.api_level >= __ANDROID_API_Q__) {
         jclass executable = env->FindClass("java/lang/reflect/Executable");
-        jfieldID artId = env->GetFieldID(executable, "artMethod", "J");
-        jobject method = env->ToReflectedMethod(clazz, methodId, true);
-        return reinterpret_cast<void *>(env->GetLongField(method, artId));
-    } else {
-        return methodId;
+        if (executable) {
+            jfieldID artId = env->GetFieldID(executable, "artMethod", "J");
+            if (artId) {
+                jobject method = env->ToReflectedMethod(clazz, methodId, true);
+                if (method) {
+                    jlong value = env->GetLongField(method, artId);
+                    if (!env->ExceptionCheck()) {
+                        return reinterpret_cast<void *>(value);
+                    }
+                }
+            }
+        }
+        env->ExceptionClear();
     }
+    return methodId;
 }
 
 static void *GetFieldMethod(JNIEnv *env, jobject field) {
+    if (!field) {
+        return nullptr;
+    }
     if (HookEnv.api_level >= __ANDROID_API_Q__) {
         jclass fieldClass = env->FindClass("java/lang/reflect/Field");
-        jmethodID getArtField = env->GetMethodID(fieldClass, "getArtField", "()J");
-        return reinterpret_cast<void *>(env->CallLongMethod(field, getArtField));
-    } else {
-        return env->FromReflectedField(field);
+        if (fieldClass) {
+            jmethodID getArtField = env->GetMethodID(fieldClass, "getArtField", "()J");
+            if (getArtField) {
+                jlong value = env->CallLongMethod(field, getArtField);
+                if (!env->ExceptionCheck()) {
+                    return reinterpret_cast<void *>(value);
+                }
+            }
+        }
+        env->ExceptionClear();
     }
+    return env->FromReflectedField(field);
 }
 
 // 通过反射判断方法是否 native：
@@ -147,6 +194,10 @@ bool CheckFlags(JNIEnv *env, jclass clazz, jmethodID methodId, void *artMethod) 
 
 void JniHook::HookJniFun(JNIEnv *env, jobject java_method, void *new_fun,
                          void **orig_fun, bool is_static) {
+    if (!HookEnv.method_utils_class || !HookEnv.get_method_desc_id) {
+        ALOGD("HookJniFun skipped: MethodUtils unavailable");
+        return;
+    }
     const char *class_name = GetMethodDeclaringClass(env, java_method);
     const char *method_name = GetMethodName(env, java_method);
     const char *sign = GetMethodDesc(env, java_method);
@@ -244,6 +295,11 @@ __attribute__((section (".mytext")))  JNICALL void set_field_accessible
 
 void registerNative(JNIEnv *env) {
     jclass clazz = env->FindClass("top/niunaijun/jnihook/jni/JniHook");
+    if (!clazz) {
+        env->ExceptionClear();
+        ALOGE("jni register: JniHook class not found");
+        return;
+    }
     JNINativeMethod gMethods[] = {
             {"nativeOffset",  "()V",                                            (void *) native_offset},
             {"nativeOffset2", "()V",                                            (void *) native_offset2},
@@ -251,6 +307,7 @@ void registerNative(JNIEnv *env) {
             {"setAccessible", "(Ljava/lang/Class;Ljava/lang/reflect/Field;)V",  (void *) set_field_accessible},
     };
     if (env->RegisterNatives(clazz, gMethods, sizeof(gMethods) / sizeof(gMethods[0])) < 0) {
+        env->ExceptionClear();
         ALOGE("jni register error.");
     }
 }
@@ -258,29 +315,44 @@ void registerNative(JNIEnv *env) {
 void JniHook::InitJniHook(JNIEnv *env, int api_level) {
     registerNative(env);
     HookEnv.api_level = api_level;
+    // 任何一步失败都保持「偏移为 0」——所有 hook 会静默跳过（功能降级），
+    // 但绝不崩溃。这是 Android 14+ 上 ArtMethod 布局不再稳定的必要兜底。
+    HookEnv.art_method_native_offset = 0;
+    HookEnv.art_method_flags_offset = 0;
+    HookEnv.art_field_flags_offset = 0;
 
     jclass clazz = env->FindClass("top/niunaijun/jnihook/jni/JniHook");
+    if (!clazz) {
+        env->ExceptionClear();
+        ALOGE("JniHook init: anchor class not found, jni hook disabled");
+        return;
+    }
     jmethodID nativeOffsetId = env->GetStaticMethodID(clazz, "nativeOffset", "()V");
     jmethodID nativeOffset2Id = env->GetStaticMethodID(clazz, "nativeOffset2", "()V");
-
-    jfieldID nativeOffsetFieldId = env->GetStaticFieldID(clazz, "NATIVE_OFFSET", "I");
-    jfieldID nativeOffsetField2Id = env->GetStaticFieldID(clazz, "NATIVE_OFFSET_2", "I");
-
-    void *nativeOffsetField = GetFieldMethod(env, env->ToReflectedField(clazz, nativeOffsetFieldId,
-                                                                        true));
-    void *nativeOffsetField2 = GetFieldMethod(env, env->ToReflectedField(clazz, nativeOffsetField2Id,
-                                                                         true));
-    HookEnv.art_field_size = (size_t) nativeOffsetField2 - (size_t) nativeOffsetField;
+    if (!nativeOffsetId || !nativeOffset2Id) {
+        env->ExceptionClear();
+        ALOGE("JniHook init: anchor methods missing, jni hook disabled");
+        return;
+    }
 
     void *nativeOffset = GetArtMethod(env, clazz, nativeOffsetId);
     void *nativeOffset2 = GetArtMethod(env, clazz, nativeOffset2Id);
-    HookEnv.art_method_size = (size_t) nativeOffset2 - (size_t) nativeOffset;
+    long methodDelta = (long) nativeOffset2 - (long) nativeOffset;
+    // 两个锚点方法的地址差就是 ArtMethod 步长。差值不合理 = 没拿到真正的
+    // ArtMethod（或布局不认识），继续按这个步长扫描会越界，直接放弃。
+    if (!nativeOffset || !nativeOffset2 || methodDelta <= 0 || methodDelta > 256) {
+        ALOGE("JniHook init: implausible method delta, jni hook disabled");
+        HookEnv.method_utils_class = env->FindClass("top/niunaijun/jnihook/MethodUtils");
+        env->ExceptionClear();
+        return;
+    }
+    HookEnv.art_method_size = (unsigned int) methodDelta;
 
     // calc native offset
     auto artMethod = reinterpret_cast<uintptr_t *>(nativeOffset);
-    for (int i = 0; i < HookEnv.art_method_size; ++i) {
+    for (unsigned int i = 0; i < HookEnv.art_method_size; ++i) {
         if (reinterpret_cast<void *>(artMethod[i]) == native_offset) {
-            HookEnv.art_method_native_offset = i;
+            HookEnv.art_method_native_offset = (int) i;
             break;
         }
     }
@@ -299,10 +371,10 @@ void JniHook::InitJniHook(JNIEnv *env, int api_level) {
     // 扫描时必须把这个运行时标志位掉再比。
     const uint32_t runtime_only_mask = kAccFastNative | kAccCriticalNative;
     char *start = reinterpret_cast<char *>(artMethod);
-    for (int i = 1; i < HookEnv.art_method_size; ++i) {
+    for (unsigned int i = 1; i < HookEnv.art_method_size; ++i) {
         auto value = *(uint32_t *) (start + i * sizeof(uint32_t));
         if ((value & ~runtime_only_mask) == (flags & ~runtime_only_mask)) {
-            HookEnv.art_method_flags_offset = i * sizeof(uint32_t);
+            HookEnv.art_method_flags_offset = (int) (i * sizeof(uint32_t));
             break;
         }
     }
@@ -315,25 +387,50 @@ void JniHook::InitJniHook(JNIEnv *env, int api_level) {
               *(uint32_t *) (start + 24), *(uint32_t *) (start + 28));
     }
 
-    flags = 0x0;
-    flags = flags | kAccPublic;
-    flags = flags | kAccStatic;
-    flags = flags | kAccFinal;
-    if (api_level >= __ANDROID_API_Q__) {
-        flags = flags | kAccPublicApi;
+    // ---- ArtField 步长与 flags 偏移 ----
+    // 这一段在 Android 17 上曾因 getArtField() 被移除而直接把进程打崩，
+    // 所以每个 JNI 入口都要判空之后再往下走。
+    jfieldID nativeOffsetFieldId = env->GetStaticFieldID(clazz, "NATIVE_OFFSET", "I");
+    jfieldID nativeOffsetField2Id = env->GetStaticFieldID(clazz, "NATIVE_OFFSET_2", "I");
+    jobject reflectedField = nullptr;
+    jobject reflectedField2 = nullptr;
+    if (nativeOffsetFieldId && nativeOffsetField2Id) {
+        reflectedField = env->ToReflectedField(clazz, nativeOffsetFieldId, true);
+        reflectedField2 = env->ToReflectedField(clazz, nativeOffsetField2Id, true);
     }
-    const uint32_t field_runtime_only_mask = kAccFastNative | kAccCriticalNative;
-    char *fieldStart = reinterpret_cast<char *>(nativeOffsetField);
-    for (int i = 1; i < HookEnv.art_field_size; ++i) {
-        auto value = *(int32_t *) (fieldStart + i * sizeof(int32_t));
-        if ((static_cast<uint32_t>(value) & ~field_runtime_only_mask) ==
-            (flags & ~field_runtime_only_mask)) {
-            HookEnv.art_field_flags_offset = i * sizeof(int32_t);
-            break;
+    void *nativeOffsetField = GetFieldMethod(env, reflectedField);
+    void *nativeOffsetField2 = GetFieldMethod(env, reflectedField2);
+    long fieldDelta = (long) nativeOffsetField2 - (long) nativeOffsetField;
+    if (nativeOffsetField && nativeOffsetField2 && fieldDelta > 0 && fieldDelta <= 256) {
+        HookEnv.art_field_size = (unsigned int) fieldDelta;
+
+        flags = 0x0;
+        flags = flags | kAccPublic;
+        flags = flags | kAccStatic;
+        flags = flags | kAccFinal;
+        if (api_level >= __ANDROID_API_Q__) {
+            flags = flags | kAccPublicApi;
         }
+        const uint32_t field_runtime_only_mask = kAccFastNative | kAccCriticalNative;
+        char *fieldStart = reinterpret_cast<char *>(nativeOffsetField);
+        for (unsigned int i = 1; i < HookEnv.art_field_size; ++i) {
+            auto value = *(int32_t *) (fieldStart + i * sizeof(int32_t));
+            if ((static_cast<uint32_t>(value) & ~field_runtime_only_mask) ==
+                (flags & ~field_runtime_only_mask)) {
+                HookEnv.art_field_flags_offset = (int) (i * sizeof(int32_t));
+                break;
+            }
+        }
+    } else {
+        ALOGE("JniHook init: art field unresolved, setAccessible(field) disabled");
     }
 
     HookEnv.method_utils_class = env->FindClass("top/niunaijun/jnihook/MethodUtils");
+    if (!HookEnv.method_utils_class) {
+        env->ExceptionClear();
+        ALOGE("JniHook init: MethodUtils missing, HookJniFun disabled");
+        return;
+    }
     HookEnv.get_method_desc_id = env->GetStaticMethodID(HookEnv.method_utils_class, "getDesc",
                                                         "(Ljava/lang/reflect/Method;)Ljava/lang/String;");
     HookEnv.get_method_declaring_class_id = env->GetStaticMethodID(HookEnv.method_utils_class,
@@ -341,6 +438,7 @@ void JniHook::InitJniHook(JNIEnv *env, int api_level) {
                                                                    "(Ljava/lang/reflect/Method;)Ljava/lang/String;");
     HookEnv.get_method_name_id = env->GetStaticMethodID(HookEnv.method_utils_class, "getMethodName",
                                                         "(Ljava/lang/reflect/Method;)Ljava/lang/String;");
+    env->ExceptionClear();
     // 偏移扫描是否成功决定 jnihook 在本机型上能不能工作，必须留一条可观测日志：
     // native_offset=0 或 flags_offset=0 说明 ArtMethod 布局没被正确识别，
     // 此时所有 hook 都会静默跳过（功能降级，但不应该崩）。
