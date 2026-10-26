@@ -28,40 +28,41 @@ class InstanceController(
 ) {
 
     suspend fun reconcile(): List<RuntimeInstance> = withContext(Dispatchers.IO) {
-        val saved = store.load()
+        val saved = runCatching { store.load() }.getOrElse { return@withContext emptyList() }
         if (saved.isEmpty()) return@withContext emptyList()
 
+        // 单条实例的取证失败只影响它自己，绝不能让整个对账抛出——
+        // 对账一旦抛异常，上层会停在"空列表"，看起来就像实例全丢了。
         val reconciled = saved.map { instance ->
-            // 先重建引擎内存映射，否则 queryState 只会得到 NOT_INSTALLED
-            try {
-                engine.attachExisting(instance)
-            } catch (t: Throwable) {
-                // 重建失败也不阻断对账
-            }
-            val probe = engine.queryState(instance.id)
-            val probed = (probe as? EngineResult.Success)?.value
-            if (probed == null) {
-                // 取证失败：保持磁盘状态，但要避免把 RUNNING 继续假装下去
-                if (instance.state in TRANSITIONAL) {
-                    instance.copy(
-                        state = RuntimeState.UNKNOWN_INTERRUPTED,
-                        lastExitReason = ExitReason.UNKNOWN
-                    )
-                } else {
-                    instance
-                }
-            } else {
-                val exitReason = when {
-                    instance.state in TRANSITIONAL && probed.state != RuntimeState.RUNNING ->
-                        probed.exitReason ?: inferExit(instance.state)
-                    else -> instance.lastExitReason
-                }
-                instance.copy(state = probed.state, lastExitReason = exitReason)
-            }
+            runCatching { reconcileOne(instance) }.getOrElse { instance }
         }
 
-        store.save(reconciled)
+        // 落盘失败也照样把内存结果返给 UI（最多下次启动状态不准，不影响可见性）
+        runCatching { store.save(reconciled) }
         reconciled
+    }
+
+    private suspend fun reconcileOne(instance: RuntimeInstance): RuntimeInstance {
+        // 先重建引擎内存映射，否则 queryState 只会得到 NOT_INSTALLED
+        runCatching { engine.attachExisting(instance) }
+
+        val probed = runCatching { engine.queryState(instance.id) }.getOrNull()
+            ?.let { (it as? EngineResult.Success)?.value }
+            ?: return if (instance.state in TRANSITIONAL) {
+                // 取证失败：保持磁盘状态，但要避免把 RUNNING 继续假装下去
+                instance.copy(state = RuntimeState.UNKNOWN_INTERRUPTED, lastExitReason = ExitReason.UNKNOWN)
+            } else {
+                instance
+            }
+
+        val exitReason = when {
+            instance.state in TRANSITIONAL && probed.state != RuntimeState.RUNNING ->
+                probed.exitReason ?: inferExit(instance.state)
+            else -> instance.lastExitReason
+        }
+        // 引擎报 NOT_INSTALLED（沙箱里查不到这个包）时也保留记录，
+        // 只把状态降级——记录本身属于用户的资产，删除只能由用户显式触发。
+        return instance.copy(state = probed.state, lastExitReason = exitReason)
     }
 
     private fun inferExit(state: RuntimeState): ExitReason = when (state) {

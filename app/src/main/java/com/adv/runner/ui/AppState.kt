@@ -17,7 +17,9 @@ import com.adv.runner.MainActivity
 import com.adv.runner.core.control.InstanceController
 import com.adv.runner.core.model.ApkInfo
 import com.adv.runner.core.model.EngineCapabilities
+import com.adv.runner.core.model.EngineErrorCode
 import com.adv.runner.core.model.EngineResult
+import com.adv.runner.core.model.engineFailure
 import com.adv.runner.core.model.ExitReason
 import com.adv.runner.core.model.RunEvent
 import com.adv.runner.core.model.RunEventType
@@ -83,6 +85,23 @@ class AppState(
         private set
     var status by mutableStateOf("就绪：请导入一个 APK")
         private set
+
+    /**
+     * 启动阶段。
+     *
+     * 存在的理由：`instances` 为空既可能是「真没装过」，也可能是「清单还没读出来 / 读失败了」。
+     * 旧实现两种情况都渲染成同一个空态「暂无实例」，于是引擎侧一次异常就能让用户
+     * 以为实例全丢了（真机反馈："重启后实例都没了"）。
+     */
+    var bootPhase by mutableStateOf(BootPhase.LOADING)
+        private set
+
+    /** 启动失败的原因（引擎初始化/对账阶段），供空态页展示与重试。 */
+    var initError by mutableStateOf<String?>(null)
+        private set
+
+    /** 防止 initialize() 并发重入（LaunchedEffect 与手动重试可能同时触发）。 */
+    private var initializing = false
     var screen by mutableStateOf(Screen.HOME)
         private set
     var selectedId by mutableStateOf<String?>(null)
@@ -437,41 +456,114 @@ class AppState(
     val selectedInstance: RuntimeInstance? get() = instances.firstOrNull { it.id == selectedId }
 
     suspend fun initialize() {
-        refreshPermissions()
-        migrator?.migrate()
-        val root = File(context.filesDir, "engine/blackbox")
-        val before = store.load()
-        when (val result = engine.initialize(
-            EngineContext(context.applicationContext, root, logger, deviceAbis, deviceSdk)
-        )) {
-            is EngineResult.Success -> {
-                caps = result.value
-                instances = controller.reconcile()
-                recordReconcileEvents(before)
-                if (instances.isNotEmpty()) {
-                    status = "已恢复 ${instances.size} 个实例并对账完成"
+        if (initializing) return
+        initializing = true
+        bootPhase = BootPhase.LOADING
+        initError = null
+        try {
+            runCatching { refreshPermissions() }
+                .onFailure { logger.warn("AppState", "刷新权限状态失败", it) }
+
+            // ① 先只读「磁盘上的实例清单」并立刻上屏。
+            //    这一步刻意放在引擎初始化之前：清单在 Room 里，和引擎能不能起来无关。
+            //    旧实现把它塞进「引擎初始化成功」分支，引擎侧任何一次异常都会让界面停在
+            //    空列表（状态文字还是默认的「就绪」），用户看到的就是「实例全丢了」。
+            val persisted = runCatching { store.load() }
+                .onFailure { logger.error("AppState", "读取实例清单失败", it) }
+                .getOrElse {
+                    // 读失败不能再假装"没有实例"：标记失败并让首页说明原因
+                    bootPhase = BootPhase.FAILED
+                    initError = "读取本地实例清单失败：${it.javaClass.simpleName}: ${it.message}"
+                    status = initError!!
+                    logger.error("AppState", "启动中止：实例清单读取失败", it)
+                    return
                 }
-                record(
-                    RunEventType.INIT,
-                    level = "INFO",
-                    message = "引擎初始化成功：${result.value.engineId} ${result.value.engineVersion}"
+            instances = persisted
+            logger.info("AppState", "启动：磁盘实例 ${persisted.size} 个")
+
+            runCatching { migrator?.migrate() }
+                .onFailure { logger.warn("AppState", "旧版 JSON 迁移失败（已跳过）", it) }
+
+            val root = File(context.filesDir, "engine/blackbox")
+            // ② 引擎初始化：失败/抛异常都不允许影响已加载的清单
+            val initResult = runCatching {
+                engine.initialize(
+                    EngineContext(context.applicationContext, root, logger, deviceAbis, deviceSdk)
                 )
-                // 预热引擎服务进程（:black），把首次启动的等待提前消化掉；失败不影响流程
-                scope.launch { engine.prewarm() }
-                // 历史实例补生成图标缓存（老版本导入时还没这个功能）
-                scope.launch { backfillIcons() }
+            }.getOrElse { t ->
+                logger.error("AppState", "引擎初始化抛异常", t)
+                engineFailure(
+                    EngineErrorCode.ENGINE_NOT_AVAILABLE,
+                    "${t.javaClass.simpleName}: ${t.message}"
+                )
             }
 
-            is EngineResult.Failure -> {
-                status = "引擎初始化失败：${result.message}"
-                record(
-                    RunEventType.INIT,
-                    level = "ERROR",
-                    code = result.code.name,
-                    message = "引擎初始化失败：${result.message}"
-                )
+            when (initResult) {
+                is EngineResult.Success -> {
+                    caps = initResult.value
+                    // ③ 对账失败也不清空清单：宁可状态显示为"未知"，也不能让实例消失
+                    val reconciled = runCatching { controller.reconcile() }
+                        .onFailure { logger.error("AppState", "实例对账失败（保留磁盘状态）", it) }
+                        .getOrNull()
+                    if (reconciled != null) {
+                        instances = reconciled
+                        runCatching { recordReconcileEvents(persisted) }
+                            .onFailure { logger.warn("AppState", "写对账事件失败", it) }
+                    }
+                    bootPhase = BootPhase.READY
+                    status = when {
+                        instances.isNotEmpty() -> "已恢复 ${instances.size} 个实例并对账完成"
+                        else -> "就绪：请导入一个 APK"
+                    }
+                    runCatching {
+                        record(
+                            RunEventType.INIT,
+                            level = "INFO",
+                            message = "引擎初始化成功：${initResult.value.engineId} ${initResult.value.engineVersion}"
+                        )
+                    }.onFailure { logger.warn("AppState", "写 INIT 事件失败", it) }
+                    // 预热引擎服务进程（:black），把首次启动的等待提前消化掉；失败不影响流程
+                    scope.launch { runCatching { engine.prewarm() } }
+                    // 历史实例补生成图标缓存（老版本导入时还没这个功能）
+                    scope.launch { runCatching { backfillIcons() } }
+                }
+
+                is EngineResult.Failure -> {
+                    bootPhase = BootPhase.FAILED
+                    initError = initResult.message
+                    // 关键：清单已加载就照常展示，只在状态栏说明引擎起不来
+                    status = if (instances.isEmpty()) {
+                        "引擎初始化失败：${initResult.message}"
+                    } else {
+                        "已加载 ${instances.size} 个实例；引擎初始化失败：${initResult.message}"
+                    }
+                    logger.error("AppState", "引擎初始化失败：${initResult.code} ${initResult.message}")
+                    runCatching {
+                        record(
+                            RunEventType.INIT,
+                            level = "ERROR",
+                            code = initResult.code.name,
+                            message = "引擎初始化失败：${initResult.message}"
+                        )
+                    }.onFailure { logger.warn("AppState", "写 INIT 失败事件失败", it) }
+                }
             }
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            throw t
+        } catch (t: Throwable) {
+            // 兜底：任何未预料的异常都要留痕并让 UI 有机会重试，绝不能静默停在空列表
+            bootPhase = BootPhase.FAILED
+            initError = "${t.javaClass.simpleName}: ${t.message}"
+            status = "启动失败：${initError}"
+            logger.error("AppState", "启动流程异常", t)
+        } finally {
+            initializing = false
         }
+    }
+
+    /** 启动失败后的手动重试（空态页的「重试」按钮）。 */
+    fun retryInitialize() {
+        scope.launch { initialize() }
     }
 
     suspend fun import(uri: Uri) {
@@ -577,12 +669,20 @@ class AppState(
 
     private suspend fun doInstall(info: ApkInfo, signatureMode: SignatureMode): RuntimeInstance? {
         val instanceId = UUID.randomUUID().toString()
+        // userId 槽位必须避开磁盘上已有的实例：内存清单万一没加载好，
+        // 直接按 instances 取 max+1 会撞上 (engine_id, virtual_user_id) 唯一索引，
+        // 整次落盘回滚，实例就"装上了但下次启动不见了"。
+        val known = if (instances.isEmpty()) {
+            runCatching { store.load() }.getOrDefault(emptyList())
+        } else {
+            instances
+        }
         val request = InstallRequest(
             instanceId = instanceId,
             apkPath = info.storedPath,
             sha256 = info.sha256,
             packageName = info.packageName,
-            virtualUserId = (instances.maxOfOrNull { it.virtualUserId } ?: -1) + 1,
+            virtualUserId = (known.maxOfOrNull { it.virtualUserId } ?: -1) + 1,
             expectedSignatureSha256 = info.signerSha256
         )
         return when (val result = engine.installApk(request)) {
@@ -877,7 +977,8 @@ class AppState(
         val instance = instances.firstOrNull { it.id == id }
         engine.uninstall(id)
         val updated = instances.filterNot { it.id == id }
-        persist(updated)
+        // 删掉最后一个实例是合法的整体清空，需要显式放行
+        persist(updated, allowEmptyOverwrite = true)
         if (instance != null) {
             record(RunEventType.DELETE, instance = instance, message = "实例已删除（仅沙箱内数据）")
         }
@@ -1257,9 +1358,44 @@ class AppState(
         screen = Screen.HOME
     }
 
-    private suspend fun persist(list: List<RuntimeInstance>) {
-        instances = list
-        store.save(list)
+    /**
+     * 落盘实例清单。
+     *
+     * 关键防御：内存清单为空时**拒绝**把磁盘上已有的实例整表覆盖掉。
+     * 旧实现是「deleteAll + insert」的整表替换语义，一旦某次调用发生在
+     * 清单还没加载好的时刻（initialize 失败、协程被取消），磁盘上的实例就被抹掉了，
+     * 表现为「重启后实例全丢」。删除最后一个实例这类合法清空走 [allowEmptyOverwrite]。
+     */
+    private suspend fun persist(list: List<RuntimeInstance>, allowEmptyOverwrite: Boolean = false) {
+        val previous = instances
+        if (list.isEmpty() && previous.isNotEmpty() && !allowEmptyOverwrite) {
+            logger.error(
+                "AppState",
+                "拒绝把 ${previous.size} 个实例的清单覆盖为空（疑似初始化未完成）"
+            )
+            return
+        }
+        // 内存清单为空却要写非空清单：说明加载环节出过问题（初始化失败/被取消）。
+        // 此时整表覆盖会顺手删掉没被加载进来的历史实例，改为与磁盘做并集——
+        // 宁可多留一条，也不静默删除用户的数据。
+        var target = list
+        if (previous.isEmpty() && list.isNotEmpty()) {
+            val onDisk = runCatching { store.load() }.getOrDefault(emptyList())
+            val ids = list.mapTo(HashSet()) { it.id }
+            val missing = onDisk.filterNot { it.id in ids }
+            if (missing.isNotEmpty()) {
+                logger.warn("AppState", "内存清单为空但磁盘有 ${onDisk.size} 个实例，按并集写入")
+                target = missing + list
+            }
+        }
+        instances = target
+        // 落盘失败不向上抛：抛出去会把调用方的协程打断（安装/删除流程走一半），
+        // 而磁盘上仍是上一份完整清单——记日志、让状态如实提示即可。
+        runCatching { store.save(target) }
+            .onFailure {
+                logger.error("AppState", "写入实例清单失败（磁盘保持上一份）", it)
+                status = "写入实例清单失败：${it.javaClass.simpleName}: ${it.message}"
+            }
     }
 
     private suspend fun record(
@@ -1325,9 +1461,18 @@ class AppState(
     }
 }
 
+/**
+ * 启动阶段。
+ *
+ * LOADING：清单还没读出来（首帧），不能显示「暂无实例」；
+ * READY：清单与引擎都已就绪，此时列表为空才是真的没有实例；
+ * FAILED：读清单或引擎初始化失败——必须说明原因并给重试入口，
+ *         不能让失败伪装成「你没有实例」。
+ */
+enum class BootPhase { LOADING, READY, FAILED }
+
 /** 首页实例排序方式。 */
-enum class InstanceSort(val label: String) {
-    RECENT("最近使用"),
+enum class InstanceSort(val label: String) {    RECENT("最近使用"),
     NAME("名称"),
     CREATED("导入时间"),
 }

@@ -273,7 +273,20 @@ private fun HomeScreen(state: AppState, scope: CoroutineScope) {
         }
 
         Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleLarge)
-        Text(state.status, style = MaterialTheme.typography.bodySmall)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                state.status,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f)
+            )
+            // 启动未完成时（引擎起不来），实例仍在列表里，但点启动必然失败——
+            // 这里常驻一个重试入口，别让用户去猜"为什么不能启动"。
+            if (state.bootPhase == BootPhase.FAILED) {
+                TextButton(onClick = { state.retryInitialize() }, enabled = !state.busy) {
+                    Text("重试", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
 
         Button(
             onClick = { picker.launch(APK_MIME_TYPES) },
@@ -321,22 +334,49 @@ private fun HomeScreen(state: AppState, scope: CoroutineScope) {
             )
         }
 
-        if (state.instances.isEmpty()) {
-            EmptyState(
-                glyph = "⌂",
-                title = "暂无实例",
-                hint = "点上方「导入 APK」创建第一个实例。",
-                actionLabel = "导入 APK",
-                onAction = { picker.launch(APK_MIME_TYPES) }
-            )
-        } else if (state.visibleInstances.isEmpty()) {
-            EmptyState(
-                glyph = "⌕",
-                title = "没有匹配的实例",
-                hint = "换个关键词，或清除搜索条件。",
-                actionLabel = "清除搜索",
-                onAction = { state.updateInstanceQuery("") }
-            )
+        when {
+            // 清单还没读出来：别急着说"暂无实例"——那会让用户以为实例丢了
+            state.instances.isEmpty() && state.bootPhase == BootPhase.LOADING -> {
+                EmptyState(
+                    glyph = "◌",
+                    title = "正在加载实例…",
+                    hint = "正在从本地数据库读取实例清单。",
+                    actionLabel = null,
+                    onAction = {}
+                )
+            }
+
+            // 启动失败（读清单或引擎初始化）：如实说明原因，并给重试入口。
+            // 注意不能落回"暂无实例"，否则用户会以为自己的实例被删了。
+            state.instances.isEmpty() && state.bootPhase == BootPhase.FAILED -> {
+                EmptyState(
+                    glyph = "!",
+                    title = "启动未完成",
+                    hint = state.initError ?: "未知原因，可尝试重试。",
+                    actionLabel = "重试",
+                    onAction = { state.retryInitialize() }
+                )
+            }
+
+            state.instances.isEmpty() -> {
+                EmptyState(
+                    glyph = "⌂",
+                    title = "暂无实例",
+                    hint = "点上方「导入 APK」创建第一个实例。",
+                    actionLabel = "导入 APK",
+                    onAction = { picker.launch(APK_MIME_TYPES) }
+                )
+            }
+
+            state.visibleInstances.isEmpty() -> {
+                EmptyState(
+                    glyph = "⌕",
+                    title = "没有匹配的实例",
+                    hint = "换个关键词，或清除搜索条件。",
+                    actionLabel = "清除搜索",
+                    onAction = { state.updateInstanceQuery("") }
+                )
+            }
         }
         state.visibleInstances.forEachIndexed { index, instance ->
             InstanceRow(

@@ -21,6 +21,17 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 69,
+            versionName = "0.9.5",
+            title = "实例清单不再因启动异常而“消失”",
+            highlights = listOf(
+                "先读本地实例清单并立即上屏，引擎初始化失败也不影响实例可见",
+                "引擎初始化/对账异常不再被静默吞掉：写入日志与事件，并在首页说明原因、提供重试",
+                "空列表区分「加载中」「引擎失败」「确实没有实例」，不再一律显示“暂无实例”",
+                "写清单增加保护：内存清单异常为空时禁止整表覆盖，按并集保留磁盘上的实例",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 68,
             versionName = "0.9.4",
             title = "弹窗移除调用栈更完整",
