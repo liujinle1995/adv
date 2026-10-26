@@ -265,6 +265,39 @@ class BlackBoxEngineAdapter(
         EngineResult.Success(Unit)
     }
 
+    /**
+     * 直接启动指定 Activity（绕过 launcher 入口）。
+     *
+     * 用途：部分应用的启动页在沙箱里跑不通（例如红果的 SplashActivity 依赖
+     * 前一个进程留下的初始化结果，白屏不跳转），但主界面本身是好的。
+     * 指定组件启动可以绕过启动页，也用于确认「引擎/渲染没问题，只是启动页逻辑不成立」。
+     */
+    suspend fun launchComponent(instanceId: String, className: String): EngineResult<Unit> =
+        withContext(Dispatchers.IO) {
+            val slot = slots[instanceId]
+                ?: return@withContext engineFailure(
+                    EngineErrorCode.LAUNCH_FAILED,
+                    "找不到实例槽位（宿主进程重启后会丢失，需重建实例记录）：$instanceId"
+                )
+            val failure = runCatching {
+                val intent = android.content.Intent().apply {
+                    component = android.content.ComponentName(slot.packageName, className)
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                BlackBoxCore.get().startActivity(intent, slot.userId)
+            }.exceptionOrNull()
+            if (failure != null) {
+                logger.error(TAG, "指定组件启动异常 pkg=${slot.packageName} cls=$className", failure)
+                return@withContext engineFailure(
+                    EngineErrorCode.LAUNCH_FAILED,
+                    "指定组件启动异常：${failure.javaClass.simpleName}: ${failure.message}",
+                    failure
+                )
+            }
+            logger.info(TAG, "已提交启动 pkg=${slot.packageName} cls=$className")
+            EngineResult.Success(Unit)
+        }
+
     override suspend fun stop(instanceId: String): EngineResult<Unit> = withContext(Dispatchers.IO) {
         val slot = slots[instanceId]
             ?: return@withContext engineFailure(EngineErrorCode.UNSUPPORTED_BY_ENGINE, "实例不存在：$instanceId")

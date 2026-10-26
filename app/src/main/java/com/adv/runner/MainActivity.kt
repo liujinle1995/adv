@@ -85,7 +85,8 @@ class MainActivity : ComponentActivity() {
                             scope = (appContext as AdvApp).appScope,
                             debugApkPath = intent?.getStringExtra(EXTRA_DEBUG_APK),
                             debugLaunchPkg = intent?.getStringExtra(EXTRA_DEBUG_LAUNCH),
-                            debugReset = intent?.getBooleanExtra(EXTRA_DEBUG_RESET, false) == true
+                            debugReset = intent?.getBooleanExtra(EXTRA_DEBUG_RESET, false) == true,
+                            debugComponent = intent?.getStringExtra(EXTRA_DEBUG_COMPONENT)
                         )
                     }
                     AppRoot(state)
@@ -120,5 +121,13 @@ class MainActivity : ComponentActivity() {
          *     --es debug_launch com.phoenix.read --ez debug_reset true
          */
         const val EXTRA_DEBUG_RESET = "debug_reset"
+
+        /**
+         * 调试入口：直接启动指定组件，绕过 launcher 入口（跳过启动页）。
+         *
+         * adb shell am start -n com.adv.runner/.MainActivity \
+         *     --es debug_component "com.phoenix.read/com.dragon.read.pages.main.MainFragmentActivity"
+         */
+        const val EXTRA_DEBUG_COMPONENT = "debug_component"
     }
 }

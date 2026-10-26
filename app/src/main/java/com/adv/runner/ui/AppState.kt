@@ -70,6 +70,8 @@ class AppState(
     val debugLaunchPkg: String? = null,
     /** 调试入口：拉起前先清空该实例的沙箱数据（用于排除「反复失败被记进安全模式」）。 */
     val debugReset: Boolean = false,
+    /** 调试入口：直接拉起指定组件，格式 `包名/类名`（跳过启动页）。 */
+    val debugComponent: String? = null,
     private val migrator: LegacyMigrator? = null
 ) {
 
@@ -1159,6 +1161,10 @@ class AppState(
         }
         if (resetData) {
             val removed = withContext(Dispatchers.IO) { wipeInstanceData(pkg) }
+            // 除了删数据目录，还要让应用下次启动时清掉自己的「连续崩溃计数」：
+            // 该计数存在 SharedPreferences 里，被删目录后可能仍残留/由应用重建，
+            // 一旦达到阈值应用会走安全模式初始化分支并卡死。
+            markSafeModeReset(instance.dataRoot)
             top.niunaijun.blackbox.utils.DiagLog.log("debug", "reset removed dirs=$removed")
             status = "已清空数据，正在启动：${instance.displayName}"
         } else {
@@ -1178,6 +1184,25 @@ class AppState(
      * 只删 data/user/<id>/<pkg> 和 data/user_de/<id>/<pkg>，
      * 不动 data/app/<pkg>（那里是 apk 本体），删完应用相当于首次启动。
      */
+    /**
+     * 给实例数据目录放一个「清安全模式计数」标记。
+     *
+     * 虚拟应用启动时由引擎侧（AppInstrumentation）检测并消费：
+     * 它会在应用 onCreate 之前把应用自己的连续崩溃计数归零，
+     * 避免应用卡在「安全模式初始化」分支里死等。
+     */
+    private fun markSafeModeReset(dataRoot: String) {
+        if (dataRoot.isBlank()) return
+        runCatching {
+            val flag = File(File(dataRoot), ".adv_flags/clear_safemode")
+            flag.parentFile?.mkdirs()
+            flag.writeText(System.currentTimeMillis().toString())
+            logger.info("AppState", "已置清安全模式标记：${flag.absolutePath}")
+        }.onFailure {
+            logger.warn("AppState", "置清安全模式标记失败：${it.message}")
+        }
+    }
+
     private fun wipeInstanceData(pkg: String): Int {
         val boxRoot = File(context.filesDir.parentFile, "blackbox")
         var removed = 0
@@ -1191,6 +1216,52 @@ class AppState(
             }
         }
         return removed
+    }
+
+    /**
+     * 调试入口：直接启动指定组件（绕过 launcher 入口，即跳过启动页）。
+     *
+     * 参数格式 `包名/类名`。用于判断「主界面本身是否能在沙箱里跑」：
+     * 启动页白屏但主界面能起，说明缺的是启动页的前置条件，而不是渲染/引擎能力。
+     */
+    suspend fun debugLaunchComponent(spec: String) {
+        val pkg = spec.substringBefore('/')
+        val className = spec.substringAfter('/', "")
+        val instance = instances.firstOrNull { it.packageName == pkg }
+        if (instance == null) {
+            status = "调试启动失败：未找到 $pkg 的实例"
+            return
+        }
+        if (className.isEmpty()) {
+            status = "调试启动失败：缺少组件类名（格式 包名/类名）"
+            return
+        }
+        val adapter = engine as? com.adv.runner.engine.blackbox.BlackBoxEngineAdapter
+        if (adapter == null) {
+            status = "调试启动失败：当前引擎不支持指定组件启动"
+            return
+        }
+        when (val r = adapter.launchComponent(instance.id, className)) {
+            is EngineResult.Success -> {
+                status = "已提交启动：$className"
+                record(
+                    RunEventType.LAUNCH,
+                    instance = instance,
+                    message = "指定组件启动：$className"
+                )
+            }
+
+            is EngineResult.Failure -> {
+                status = "启动失败：${r.message}"
+                record(
+                    RunEventType.LAUNCH,
+                    instance = instance,
+                    level = "ERROR",
+                    code = r.code.name,
+                    message = "指定组件启动失败：${r.message}"
+                )
+            }
+        }
     }
 
     suspend fun debugAutoRun(path: String) {

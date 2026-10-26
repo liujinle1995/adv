@@ -21,6 +21,17 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 70,
+            versionName = "0.9.6",
+            title = "启动页卡死时自动进入主界面",
+            highlights = listOf(
+                "启动页 25 秒仍未跳转时，自动启动应用的主界面（已用红果验证可正常进入）",
+                "启动页初始化抛出的异常现在会写进诊断日志（ROM 屏蔽 logcat 时也能看到）",
+                "清数据时一并清除应用的「连续崩溃计数」，避免其卡在安全模式初始化分支",
+                "新增调试入口：可指定组件启动（跳过启动页），格式 包名/类名",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 69,
             versionName = "0.9.5",
             title = "实例清单不再因启动异常而“消失”",
