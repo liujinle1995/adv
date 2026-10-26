@@ -21,6 +21,18 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 71,
+            versionName = "0.9.7",
+            title = "补齐应用依赖的初始化，启动页不再白屏、主界面能联网",
+            highlights = listOf(
+                "启动页白屏根因是应用自身的网络层（RPC）未初始化，引擎现在会在应用初始化后补跑它",
+                "同时补跑账号、图片加载（Fresco）与全局 HTTP 客户端，主界面不再显示「网络出错」",
+                "跳过沙箱内必然卡死的 Cronet 内核初始化，改走普通 HTTP 通道",
+                "修复 Android 17 新增 AIDL 方法导致的崩溃（绑定服务时整个进程被杀）",
+                "启动页补救改为「等依赖就绪再执行」，不再依赖固定延时",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 70,
             versionName = "0.9.6",
             title = "启动页卡死时自动进入主界面",

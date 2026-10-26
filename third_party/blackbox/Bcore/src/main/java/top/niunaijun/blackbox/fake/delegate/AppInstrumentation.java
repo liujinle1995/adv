@@ -194,28 +194,10 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             if (!cls.contains("SplashActivity")) return;
             final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
 
-            // 第 1 步（12s）：内容区仍为空 → 试着自己走一遍启动页的 UI 初始化
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        int contentChildren = contentCount(activity);
-                        top.niunaijun.blackbox.utils.DiagLog.log("Recover",
-                                "before x2(): contentChildren=" + contentChildren);
-                        if (contentChildren > 0) return;
-
-                        ClassLoader cl = activity.getClassLoader();
-                        Class<?> splash = cl.loadClass(cls);
-                        java.lang.reflect.Method x2 = splash.getDeclaredMethod("x2");
-                        x2.setAccessible(true);
-                        x2.invoke(activity);
-                        top.niunaijun.blackbox.utils.DiagLog.log("Recover",
-                                "x2() invoked OK, contentChildren=" + contentCount(activity));
-                    } catch (Throwable t) {
-                        logRecoverThrowable("x2()", t);
-                    }
-                }
-            }, 12000L);
+            // 第 1 步：轮询等 RPC 就绪后再补调 x2()。
+            // 固定延时不可靠 —— 初始化可能 1 秒完成，也可能 10 秒；而且 RPC 没就绪时
+            // x2() 必然抛 `had you called RpcService.init`，等于白跑一次。
+            new SplashRecovery(activity, handler, cls).start();
 
             // 第 2 步（25s）：启动页还在（没有 finish，说明它不打算跳转）→
             // 直接启动应用的主界面 Activity。这类应用的主界面通常可以独立启动，
@@ -248,6 +230,72 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 }
             }, 25000L);
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 启动页补救：每秒检查一次，等 RPC 就绪后再调 `x2()`，最多试 3 次。
+     * 内容区一旦有子 View 就收工。
+     */
+    private static final class SplashRecovery implements Runnable {
+        private final Activity activity;
+        private final android.os.Handler handler;
+        private final String cls;
+        private int ticks;
+        private int attempts;
+
+        SplashRecovery(Activity activity, android.os.Handler handler, String cls) {
+            this.activity = activity;
+            this.handler = handler;
+            this.cls = cls;
+        }
+
+        void start() {
+            handler.postDelayed(this, 3000L);
+        }
+
+        @Override
+        public void run() {
+            try {
+                if (activity.isFinishing() || activity.isDestroyed()) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Recover", "splash gone, stop watching");
+                    return;
+                }
+                int content = contentCount(activity);
+                if (content > 0) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Recover",
+                            "splash rendered, content=" + content + " t=" + (ticks + 3) + "s");
+                    return;
+                }
+                boolean ready = isRpcReady(activity);
+                if (ready && attempts < 3) {
+                    attempts++;
+                    invokeX2();
+                }
+                ticks++;
+                if (ticks <= 25) {
+                    handler.postDelayed(this, 1000L);
+                } else {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Recover",
+                            "x2 recovery gave up, rpcReady=" + ready + " content=" + content);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        private void invokeX2() {
+            try {
+                top.niunaijun.blackbox.utils.DiagLog.log("Recover",
+                        "try x2() #" + attempts + " rpcReady=true content=" + contentCount(activity));
+                Class<?> splash = activity.getClassLoader().loadClass(cls);
+                java.lang.reflect.Method x2 = splash.getDeclaredMethod("x2");
+                x2.setAccessible(true);
+                x2.invoke(activity);
+                top.niunaijun.blackbox.utils.DiagLog.log("Recover",
+                        "x2() OK, content=" + contentCount(activity));
+            } catch (Throwable t) {
+                logRecoverThrowable("x2()", t);
+            }
         }
     }
 
@@ -750,62 +798,265 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     /**
      * 补一次字节 RPC 框架的初始化。
      *
-     * 实测该应用的启动页（SplashActivity.x2）和主界面（MainFragmentActivity.onCreate）
-     * 都会直接抛 `RuntimeException: had you called RpcService.init(Application, RpcConfig)`,
-     * 说明正常流程里该框架的初始化没有跑（它排在应用自己的异步初始化链里）。
-     * 这里按公开 API 反射补调一次；已初始化过会抛异常，被捕获后忽略。
+     * 反编译（classes26.dex）确认：真正被混淆掉的入口是
+     * <pre>
+     *   com.bytedance.rpc.m.i(Landroid/app/Application;Lcom/bytedance/rpc/c;)V
+     * </pre>
+     * 初始化完成后 `m.a`（com.bytedance.rpc.d）非空；`m.j()` 返回 true。
+     * 未初始化时所有门面方法都会走 `m.n()` 抛
+     * `had you called RpcService.init(Application,RpcConfig)`。
+     *
+     * 应用自己的初始化在 `com.dragon.read.app.launch.task.p2.e(Application)`，
+     * 由 `m0.n()` 通过 `launch.n.x("RpcInitializer", ...)` 投递到
+     * TTExecutors 的普通线程池；沙箱里这个池只收不做，所以永远没跑。
+     * 这里直接按原顺序补调一次，失败再降级到最小初始化。
      */
-    private static void ensureRpcInit(Application app) {
+    private static void ensureRpcInit(final Application app) {
+        try {
+            // Keva（字节的 KV 库）的仓库加载任务跑在它自己的 Executor 上。
+            // 沙箱里那个 Executor 不消费任务，于是所有 KevaFuture.getXxx 都永久阻塞：
+            // ttnet 的 ClientKeyManager 正卡在这儿，连带整个 HTTP 初始化起不来
+            // （表现为主界面「网络出错，请点击重试」）。
+            fixKevaExecutor(app);
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    // 顺序很重要：先网络层，再装 HTTP 客户端，再账号/图片/RPC
+                    initHttpStack(app);
+                    initRpcNow(app);
+                }
+            }, "adv-boot-init");
+            t.setDaemon(true);
+            t.start();
+            // 必须等它做完再让 Application.onCreate 返回：应用自己的首个网络请求
+            // 就在启动页/主界面上，早于这里就会失败并把界面钉死在「网络出错」。
+            // 实测整段 <100ms；给 3 秒上限，万一卡住也不至于卡死启动。
+            t.join(3000L);
+            top.niunaijun.blackbox.utils.DiagLog.log("Boot",
+                    "init joined=" + !t.isAlive());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 把 Keva 的仓库加载执行器换成一个真的会跑任务的线程池。 */
+    private static void fixKevaExecutor(Application app) {
         try {
             ClassLoader cl = app.getClassLoader();
-            if (cl == null) return;
-            Class<?> rpcService;
-            Class<?> rpcConfig;
+            Class<?> kb = cl.loadClass("com.bytedance.keva.KevaBuilder");
+            Object builder = kb.getMethod("getInstance").invoke(null);
+            java.util.concurrent.ExecutorService ex =
+                    java.util.concurrent.Executors.newCachedThreadPool();
+            java.lang.reflect.Field f = kb.getDeclaredField("mExecutor");
+            f.setAccessible(true);
+            Object old = f.get(builder);
+            f.set(builder, ex);
+            top.niunaijun.blackbox.utils.DiagLog.log("Keva",
+                    "executor " + (old == null ? "null" : old.getClass().getName()) + " -> cached");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Keva",
+                    "fix executor failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /**
+     * 手工完成 `com.dragon.read.base.http.e.h(provider)` 里除 Cronet 之外的全部步骤。
+     *
+     * 原流程 d(provider) 的顺序是：
+     * <pre>
+     *   a = provider → f() → n(app) → setCronetDepend → m(app, app) → l() → forceInitCronetKernel()
+     * </pre>
+     * 最后一步在沙箱里会永久 BLOCKED（chromium 内核起不来），而且它握着 ttnet 的锁，
+     * 一旦卡住所有网络请求都会跟着挂，界面就只显示「网络出错」。
+     * 所以这里跳过 Cronet，只做前面的必需步骤（公共参数 / TTNetDepend / tryInitTTNet）。
+     */
+    private static void initHttpStack(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> e = cl.loadClass("com.dragon.read.base.http.e");
+            Class<?> providerBase = cl.loadClass("com.dragon.read.base.http.e$b");
+            Class<?> m0 = cl.loadClass("com.dragon.read.app.launch.task.m0");
+            Class<?> providerCls = cl.loadClass("com.dragon.read.app.launch.task.m0$a");
+            Object outer = m0.getDeclaredConstructor().newInstance();
+            Object provider = null;
             try {
-                rpcService = cl.loadClass("com.bytedance.rpc.RpcService");
-                rpcConfig = cl.loadClass("com.bytedance.rpc.RpcConfig");
-            } catch (Throwable notFound) {
-                return;
+                java.lang.reflect.Constructor<?> c = providerCls.getDeclaredConstructor(
+                        m0, Application.class);
+                c.setAccessible(true);
+                provider = c.newInstance(outer, app);
+            } catch (Throwable ignored) {
+            }
+            if (provider == null) {
+                java.lang.reflect.Constructor<?> c = providerCls.getDeclaredConstructor(
+                        Application.class);
+                c.setAccessible(true);
+                provider = c.newInstance(app);
             }
 
-            Object config = null;
-            try {
-                java.lang.reflect.Method builder = null;
-                for (java.lang.reflect.Method m : rpcConfig.getMethods()) {
-                    if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
-                    if (m.getParameterTypes().length != 0) continue;
-                    String n = m.getName();
-                    if (n.equals("builder") || n.equals("newBuilder") || n.equals("create")) {
-                        builder = m;
-                        break;
-                    }
-                }
-                if (builder != null) {
-                    Object b = builder.invoke(null);
-                    config = b.getClass().getMethod("build").invoke(b);
-                }
-                if (config == null) {
-                    config = rpcConfig.getDeclaredConstructor().newInstance();
-                }
-            } catch (Throwable t) {
-                top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
-                        "config build failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
-                return;
-            }
+            java.lang.reflect.Field fa = e.getDeclaredField("a");
+            fa.setAccessible(true);
+            fa.set(null, provider);
 
-            java.lang.reflect.Method init = rpcService.getMethod("init", Application.class, rpcConfig);
-            init.invoke(null, app, config);
-            top.niunaijun.blackbox.utils.DiagLog.log("Rpc", "RpcService.init 补调成功");
+            e.getMethod("f").invoke(null);
+            e.getMethod("n", android.content.Context.class).invoke(null, app);
+            e.getMethod("m", android.content.Context.class, Application.class).invoke(null, app, app);
+            e.getMethod("l").invoke(null);
+
+            java.lang.reflect.Field fb = e.getDeclaredField("b");
+            fb.setAccessible(true);
+            fb.setBoolean(null, true);
+
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "http stack done (cronet skipped)");
         } catch (Throwable t) {
             Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
                     && t.getCause() != null) ? t.getCause() : t;
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "initHttpStack failed: " + cause.getClass().getName() + " " + cause.getMessage());
+        }
+    }
+
+    /** RPC 框架是否已完成初始化（`com.bytedance.rpc.m.j()`）。 */
+    private static boolean isRpcReady(android.content.Context ctx) {
+        try {
+            ClassLoader cl = ctx.getClassLoader();
+            if (cl == null) return false;
+            Class<?> m = cl.loadClass("com.bytedance.rpc.m");
+            Object r = m.getMethod("j").invoke(null);
+            return Boolean.TRUE.equals(r);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void initRpcNow(Application app) {
+        try {
+            // 宿主自己的 Application 也会走这里（:black 等进程），它的 ClassLoader 里
+            // 没有目标应用的类，先静默跳过，避免日志被 ClassNotFound 刷满。
+            try {
+                app.getClassLoader().loadClass("com.bytedance.rpc.m");
+            } catch (Throwable notTarget) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Rpc", "skip: target class not in loader");
+                return;
+            }
+            // 0.2) 安装全局 HTTP 客户端。
+            //      m0.n() 里这一步排在 cronet 之后，而 cronet 在沙箱里永远卡住，
+            //      于是 NetworkClient 一直是空的 —— 所有请求都会立刻失败，
+            //      主界面直接显示「网络出错，请点击重试」。
+            try {
+                ClassLoader cl = app.getClassLoader();
+                Class<?> nc = cl.loadClass("com.bytedance.common.utility.NetworkClient");
+                Object client = cl.loadClass("com.dragon.read.app.XsSSNetworkClient")
+                        .getDeclaredConstructor().newInstance();
+                boolean ok = false;
+                for (java.lang.reflect.Method m : nc.getMethods()) {
+                    if (!m.getName().equals("setDefault") || m.getParameterCount() != 1) continue;
+                    m.setAccessible(true);
+                    m.invoke(null, client);
+                    ok = true;
+                    break;
+                }
+                top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                        "NetworkClient.setDefault ok=" + ok + " client=" + client.getClass().getSimpleName());
+            } catch (Throwable t) {
+                Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+                        && t.getCause() != null) ? t.getCause() : t;
+                top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                        "NetworkClient.setDefault failed: " + cause.getClass().getName()
+                                + " " + cause.getMessage());
+            }
+
+            // 0) 补跑「账号」初始化。
+            //    m0.n(Application) 里依次做 HttpServiceInit → Timon → TTAccount → Rpc，
+            //    但实测它会 BLOCKED 在 TTNetInit.forceInitCronetKernel（Cronet 内核在
+            //    沙箱里起不来），所以不能整段调用，只挑后续真正会崩的几步。
+            if (!accountInitDone) {
+                accountInitDone = true;
+                try {
+                    ClassLoader cl = app.getClassLoader();
+                    Class<?> r3 = cl.loadClass("com.dragon.read.app.launch.task.r3");
+                    Object inst = r3.getDeclaredConstructor().newInstance();
+                    r3.getMethod("h", Application.class).invoke(inst, app);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rpc", "r3.h() done (TTAccount)");
+                } catch (Throwable t) {
+                    Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+                            && t.getCause() != null) ? t.getCause() : t;
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                            "r3.h() failed: " + cause.getClass().getName() + " " + cause.getMessage());
+                }
+            }
+
+            // 0.5) 图片加载（Fresco）。启动页/主界面都是 Compose + Fresco 套头像，
+            //      未初始化时 Fresco.newDraweeControllerBuilder 直接 NPE 崩进程。
+            try {
+                ClassLoader cl = app.getClassLoader();
+                Class<?> fresco = cl.loadClass("com.facebook.drawee.backends.pipeline.Fresco");
+                if (!Boolean.TRUE.equals(fresco.getMethod("hasBeenInitialized").invoke(null))) {
+                    Class<?> y = cl.loadClass("com.dragon.read.app.launch.task.y");
+                    Object inst = y.getDeclaredConstructor().newInstance();
+                    y.getMethod("k", Application.class).invoke(inst, app);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                            "y.k() done (Fresco), inited="
+                                    + fresco.getMethod("hasBeenInitialized").invoke(null));
+                }
+            } catch (Throwable t) {
+                Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+                        && t.getCause() != null) ? t.getCause() : t;
+                top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                        "y.k() failed: " + cause.getClass().getName() + " " + cause.getMessage());
+            }
+            if (isRpcReady(app)) return;
+
+            // 1) RPC 初始化任务
+            try {
+                ClassLoader cl = app.getClassLoader();
+                Class<?> p2 = cl.loadClass("com.dragon.read.app.launch.task.p2");
+                Object inst = p2.getDeclaredConstructor().newInstance();
+                p2.getMethod("e", Application.class).invoke(inst, app);
+                top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                        "p2.e() invoked, ready=" + isRpcReady(app));
+            } catch (Throwable t) {
+                Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+                        && t.getCause() != null) ? t.getCause() : t;
+                top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                        "p2.e() failed: " + cause.getClass().getName() + " " + cause.getMessage());
+            }
+            if (isRpcReady(app)) return;
+
+            // 2) 最后兜底：最小初始化，至少让门面方法不再抛「未初始化」
+            try {
+                ClassLoader cl = app.getClassLoader();
+                Class<?> m = cl.loadClass("com.bytedance.rpc.m");
+                Class<?> cfgCls = cl.loadClass("com.bytedance.rpc.c");
+                Class<?> cfgBuilder = cl.loadClass("com.bytedance.rpc.c$b");
+
+                Object b = m.getMethod("e").invoke(null);
+                b = cfgBuilder.getMethod("m", String.class).invoke(b, "https://reading.snssdk.com/");
+                b = cfgBuilder.getMethod("n", boolean.class).invoke(b, Boolean.TRUE);
+                b = cfgBuilder.getMethod("h", String.class, String.class)
+                        .invoke(b, "X-Xs-From-Web", "0");
+                Object empty = java.lang.reflect.Array.newInstance(cfgCls, 0);
+                Object cfg = cfgBuilder.getMethod("i", empty.getClass()).invoke(b, empty);
+
+                m.getMethod("i", Application.class, cfgCls).invoke(null, app, cfg);
+                top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                        "minimal init done, ready=" + isRpcReady(app));
+            } catch (Throwable t) {
+                Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+                        && t.getCause() != null) ? t.getCause() : t;
+                top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
+                        "minimal init failed: " + cause.getClass().getName() + " " + cause.getMessage());
+            }
+        } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
-                    "RpcService.init 补调失败: " + cause.getClass().getName() + " " + cause.getMessage());
+                    "init crashed: " + t.getClass().getSimpleName() + " " + t.getMessage());
         }
     }
 
     /** 应用 Application.onCreate 是否已返回；打断守护据此收工。 */
     private static volatile boolean advAppCreateDone = false;
+
+    /** TTAccount 只初始化一次（每个进程）。 */
+    private static volatile boolean accountInitDone = false;
 
     private static Thread mainThread() {
         return android.os.Looper.getMainLooper().getThread();
