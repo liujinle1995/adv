@@ -84,7 +84,8 @@ class MainActivity : ComponentActivity() {
                             deviceSdk = Build.VERSION.SDK_INT,
                             scope = (appContext as AdvApp).appScope,
                             debugApkPath = intent?.getStringExtra(EXTRA_DEBUG_APK),
-                            debugLaunchPkg = intent?.getStringExtra(EXTRA_DEBUG_LAUNCH)
+                            debugLaunchPkg = intent?.getStringExtra(EXTRA_DEBUG_LAUNCH),
+                            debugReset = intent?.getBooleanExtra(EXTRA_DEBUG_RESET, false) == true
                         )
                     }
                     AppRoot(state)
@@ -110,5 +111,14 @@ class MainActivity : ComponentActivity() {
          *     --es debug_launch com.phoenix.read
          */
         const val EXTRA_DEBUG_LAUNCH = "debug_launch"
+
+        /**
+         * 调试入口：启动前清空该实例的沙箱数据，用于排除「反复失败累积了
+         * 安全模式标记」这类历史状态干扰：
+         *
+         * adb shell am start -n com.adv.runner/.MainActivity \
+         *     --es debug_launch com.phoenix.read --ez debug_reset true
+         */
+        const val EXTRA_DEBUG_RESET = "debug_reset"
     }
 }

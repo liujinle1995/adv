@@ -356,6 +356,7 @@ public class BActivityThread extends IBActivityThread.Stub {
         VirtualRuntime.setupRuntime(processName, applicationInfo);
         step("VirtualRuntime");
         fixCurrentProcessName(processName);
+        diagProcessIdentity(processName);
 
         BRVMRuntime.get(BRVMRuntime.get().getRuntime()).setTargetSdkVersion(applicationInfo.targetSdkVersion);
         if (BuildCompat.isS()) {
@@ -364,6 +365,14 @@ public class BActivityThread extends IBActivityThread.Stub {
 
         NativeCore.init(Build.VERSION.SDK_INT);
         step("NativeCore");
+        try {
+            NativeCore.hookProcessName(processName);
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                    "hookProcessName ok, myProcessName=" + android.os.Process.myProcessName());
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                    "hookProcessName FAIL " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
         assert packageContext != null;
         IOCore.get().enableRedirect(packageContext);
         step("IOCore");
@@ -424,6 +433,78 @@ public class BActivityThread extends IBActivityThread.Stub {
 
     private static void step(String name) {
         top.niunaijun.blackbox.utils.DiagLog.log("Bind", "step " + name);
+    }
+
+    /**
+     * 把「进程身份在三处不同来源里的实际值」一次性记下来。
+     *
+     * 应用判断「我是不是主进程」时会用到不同来源，而它们在沙箱里的表现并不一致：
+     *   - ActivityThread.currentProcessName()：系统静态缓存，可能还是宿主 :p0
+     *   - Process.myProcessName()：读 /proc/self/cmdline，走 IO 重定向后应为虚拟应用
+     *   - /proc/self/cmdline 原文：验证重定向是否真的生效
+     * 排查这类兼容问题时如果不把三处对齐看，很容易改错地方。
+     */
+    private static void diagProcessIdentity(String expected) {
+        try {
+            StringBuilder sb = new StringBuilder("expected=").append(expected);
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            try {
+                sb.append(" currentProcessName=").append(
+                        atCls.getMethod("currentProcessName").invoke(null));
+            } catch (Throwable t) {
+                sb.append(" currentProcessName=ERR(").append(t.getClass().getSimpleName()).append(")");
+            }
+            try {
+                sb.append(" myProcessName=").append(android.os.Process.myProcessName());
+            } catch (Throwable t) {
+                sb.append(" myProcessName=ERR(").append(t.getClass().getSimpleName()).append(")");
+            }
+            sb.append(" cmdline=").append(readCmdline());
+            // 顺便把 ActivityThread 里所有非空 String 静态字段打出来，
+            // 用来确认新版本把这个值挪到了哪个字段上。
+            try {
+                for (java.lang.reflect.Field f : atCls.getDeclaredFields()) {
+                    if (f.getType() != String.class
+                            || !java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        continue;
+                    }
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(null);
+                        if (v != null && ((String) v).contains("com.adv")) {
+                            sb.append(" field.").append(f.getName()).append("=").append(v);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Ident", sb.toString());
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Ident", "diag failed " + t);
+        }
+    }
+
+    private static String readCmdline() {
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream(new java.io.File("/proc/self/cmdline"));
+            try {
+                byte[] buf = new byte[256];
+                int n = in.read(buf);
+                if (n <= 0) {
+                    return "<empty>";
+                }
+                int end = 0;
+                while (end < n && buf[end] != 0) {
+                    end++;
+                }
+                return new String(buf, 0, end, "UTF-8");
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+            return "<err " + t.getClass().getSimpleName() + ">";
+        }
     }
 
     /**

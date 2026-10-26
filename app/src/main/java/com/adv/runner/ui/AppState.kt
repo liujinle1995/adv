@@ -66,6 +66,8 @@ class AppState(
     val debugApkPath: String? = null,
     /** 调试入口：启动时直接拉起该包名的已有实例。 */
     val debugLaunchPkg: String? = null,
+    /** 调试入口：拉起前先清空该实例的沙箱数据（用于排除「反复失败被记进安全模式」）。 */
+    val debugReset: Boolean = false,
     private val migrator: LegacyMigrator? = null
 ) {
 
@@ -1037,7 +1039,7 @@ class AppState(
 
     /** adb 调试入口：解析 → 安装 → 启动 一条龙，必须在 [initialize] 完成后调用。 */
     /** 调试入口：按包名直接启动已有实例，免去 UI 点击（真机自动化验证用）。 */
-    suspend fun debugLaunchPackage(pkg: String) {
+    suspend fun debugLaunchPackage(pkg: String, resetData: Boolean = false) {
         // 实例列表可能还在加载，轮询等一会
         var instance = instances.firstOrNull { it.packageName == pkg }
         var waited = 0
@@ -1048,13 +1050,46 @@ class AppState(
         }
         top.niunaijun.blackbox.utils.DiagLog.log("debug",
                 "launch pkg=" + pkg + " found=" + (instance != null)
+                        + " reset=" + resetData
                         + " known=" + instances.joinToString(",") { it.packageName })
         if (instance == null) {
             status = "调试启动失败：未找到 $pkg 的实例"
             return
         }
-        status = "调试启动：${instance.displayName}"
+        if (resetData) {
+            val removed = withContext(Dispatchers.IO) { wipeInstanceData(pkg) }
+            top.niunaijun.blackbox.utils.DiagLog.log("debug", "reset removed dirs=$removed")
+            status = "已清空数据，正在启动：${instance.displayName}"
+        } else {
+            status = "调试启动：${instance.displayName}"
+        }
         launch(instance.id)
+    }
+
+    /**
+     * 清掉某个虚拟应用的沙箱数据目录。
+     *
+     * 目的：Tinker 这类热修复框架在连续多次启动失败后会记下"安全模式"标记，
+     * 之后每次启动都走退化分支（红果实测会走 AbsApplication.initSafeModeOtherTasks
+     * 并死等一个从未被调度的任务）。反复调试时这个标记会一直累积，
+     * 让"环境不兼容"和"历史失败残留"混在一起，没法判断。
+     *
+     * 只删 data/user/<id>/<pkg> 和 data/user_de/<id>/<pkg>，
+     * 不动 data/app/<pkg>（那里是 apk 本体），删完应用相当于首次启动。
+     */
+    private fun wipeInstanceData(pkg: String): Int {
+        val boxRoot = File(context.filesDir.parentFile, "blackbox")
+        var removed = 0
+        for (sub in listOf("data/user", "data/user_de")) {
+            val base = File(boxRoot, sub)
+            base.listFiles()?.forEach { userDir ->
+                val target = File(userDir, pkg)
+                if (target.exists() && target.deleteRecursively()) {
+                    removed++
+                }
+            }
+        }
+        return removed
     }
 
     suspend fun debugAutoRun(path: String) {

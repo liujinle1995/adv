@@ -21,6 +21,43 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 55,
+            versionName = "0.8.1",
+            title = "底层改进程标识",
+            highlights = listOf(
+                "改为直接改写系统记录的进程名，使虚拟应用彻底以自身身份运行",
+                "修复上一种做法在新系统上无效的问题",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 54,
+            versionName = "0.8.0",
+            title = "虚拟应用以自身身份运行",
+            highlights = listOf(
+                "虚拟应用读取到的进程名已是它自己，不再暴露宿主进程",
+                "新系统已移除旧的改进程名接口，改用底层替换实现",
+                "这是部分应用始终无法完成初始化、界面出不来的关键原因",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 53,
+            versionName = "0.7.9",
+            title = "修正虚拟应用的进程标识",
+            highlights = listOf(
+                "虚拟应用现在对外呈现的进程名是它自己的",
+                "修复依赖进程名判断身份的应用始终无法完成初始化的问题",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 52,
+            versionName = "0.7.8",
+            title = "排查加固应用死锁",
+            highlights = listOf(
+                "记录进程身份在各个来源里的真实取值，用于定位主进程误判",
+                "调试启动支持清空实例数据，排除历史失败累积造成的干扰",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 51,
             versionName = "0.7.7",
             title = "加固应用卡点定位",

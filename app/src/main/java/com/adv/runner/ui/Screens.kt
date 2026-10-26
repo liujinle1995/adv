@@ -74,7 +74,7 @@ fun AppRoot(state: AppState) {
     LaunchedEffect(Unit) {
         state.initialize()
         state.debugApkPath?.let { state.debugAutoRun(it) }
-        state.debugLaunchPkg?.let { state.debugLaunchPackage(it) }
+        state.debugLaunchPkg?.let { state.debugLaunchPackage(it, state.debugReset) }
     }
     // 拦截系统返回键 / 侧滑手势：二级页回上一级，顶级页放行（退出应用）
     BackHandler(enabled = !state.screen.isTopLevel) {

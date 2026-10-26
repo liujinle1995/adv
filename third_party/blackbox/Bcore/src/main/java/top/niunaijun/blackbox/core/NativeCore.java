@@ -33,6 +33,16 @@ public class NativeCore {
 
     public static native void init(int apiLevel);
 
+    /**
+     * 让 Process.myProcessName() 返回虚拟应用的进程名。
+     *
+     * :p0 是宿主 fork 出来的，cmdline 天然是「宿主:p0」。应用判断主进程时
+     * 几乎都会比对这个名字，不一致就会走降级/安全模式分支（红果实测会卡死）。
+     * Android 17 已移除 Process.setArgV0，因此改由 native 替换
+     * nativeMyProcessName 的实现，不依赖 ArtMethod 布局。
+     */
+    public static native void hookProcessName(String processName);
+
     public static native void enableIO();
 
     public static native void addIORule(String targetPath, String relocatePath);
