@@ -84,4 +84,43 @@ public class IWindowSessionProxy extends BinderInvocationStub {
     @ProxyMethod("addToDisplayAsUser")
     public static class AddToDisplayAsUser extends AddToDisplay {
     }
+
+    /**
+     * 记录窗口被移除的时刻与调用栈。
+     *
+     * 虚拟应用里的 Dialog（例如红果的首启隐私弹窗）加窗成功、却在一两秒后消失，
+     * 应用就一直停在启动页等用户点「同意」。这里把移除时的调用栈打出来，
+     * 才能区分是「应用自己 dismiss」还是「系统侧把窗口摘掉」。
+     */
+    @ProxyMethod("remove")
+    public static class Remove extends MethodHook {
+        @Override
+        protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            StringBuilder sb = new StringBuilder("remove <-");
+            try {
+                StackTraceElement[] st = new Throwable().getStackTrace();
+                int shown = 0;
+                for (StackTraceElement e : st) {
+                    String cls = e.getClassName();
+                    if (cls.startsWith("top.niunaijun.blackbox.fake")) {
+                        continue;
+                    }
+                    // 跳过反射/代理自身的中间帧，否则真正的业务调用栈会被挤掉
+                    if (cls.startsWith("java.lang.reflect.")
+                            || cls.startsWith("com.android.internal.os")
+                            || cls.startsWith("jdk.internal.reflect")) {
+                        continue;
+                    }
+                    sb.append("\n    at ").append(e);
+                    if (++shown >= 26) {
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            Object result = method.invoke(who, args);
+            top.niunaijun.blackbox.utils.DiagLog.log("WMS", sb.toString());
+            return result;
+        }
+    }
 }

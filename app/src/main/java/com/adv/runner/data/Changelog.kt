@@ -21,6 +21,22 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 68,
+            versionName = "0.9.4",
+            title = "弹窗移除调用栈更完整",
+            highlights = listOf(
+                "去掉反射中间帧，完整记录是谁关闭了弹窗",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 67,
+            versionName = "0.9.3",
+            title = "定位弹窗消失问题",
+            highlights = listOf(
+                "记录窗口被移除的调用栈，用于排查虚拟应用弹窗闪现即消失",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 66,
             versionName = "0.9.2",
             title = "移除会崩溃的进程名替换方案",
