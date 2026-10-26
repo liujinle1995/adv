@@ -735,6 +735,29 @@ class AppState(
 
     suspend fun launch(id: String) {
         val instance = instances.firstOrNull { it.id == id } ?: return
+
+        // 单实例约束：同一时间只能运行一个实例，启动前先把其它仍在运行的实例强制停掉
+        val otherRunning = instances.filter {
+            it.id != id && (it.state == RuntimeState.RUNNING || it.state == RuntimeState.STARTING)
+        }
+        if (otherRunning.isNotEmpty()) {
+            status = "正在停止其它运行中的实例…"
+            otherRunning.forEach { other ->
+                runCatching { engine.forceStop(other.id) }
+                persist(
+                    instances.map {
+                        if (it.id == other.id) {
+                            it.copy(state = RuntimeState.STOPPED, lastExitReason = ExitReason.USER_STOPPED)
+                        } else it
+                    }
+                )
+            }
+            logger.info(
+                "AppState",
+                "单实例约束：启动前已强制停止 ${otherRunning.size} 个其它实例（${otherRunning.joinToString { it.packageName }}）"
+            )
+        }
+
         val launchStartedAt = System.currentTimeMillis()
         when (val r = engine.launch(id)) {
             is EngineResult.Success -> {
@@ -806,6 +829,42 @@ class AppState(
                     level = "ERROR",
                     code = r.code.name,
                     message = "停止失败：${r.message}"
+                )
+            }
+        }
+    }
+
+    /** 强制停止：杀目标实例的所有进程（含 :xxx 子进程），用于「停止」无效时兜底。 */
+    suspend fun forceStop(id: String) {
+        val instance = instances.firstOrNull { it.id == id } ?: return
+        when (val r = engine.forceStop(id)) {
+            is EngineResult.Success -> {
+                persist(
+                    instances.map {
+                        if (it.id == id) {
+                            it.copy(state = RuntimeState.STOPPED, lastExitReason = ExitReason.USER_STOPPED)
+                        } else it
+                    }
+                )
+                status = "已强制停止：${instance.packageName}"
+                record(RunEventType.STOP, instance = instance, message = "实例已强制停止")
+                floatingButton.hide()
+                runCatching {
+                    context.startActivity(
+                        Intent(context, MainActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+            }
+
+            is EngineResult.Failure -> {
+                status = "强制停止失败：${r.message}"
+                record(
+                    RunEventType.STOP,
+                    instance = instance,
+                    level = "ERROR",
+                    code = r.code.name,
+                    message = "强制停止失败：${r.message}"
                 )
             }
         }

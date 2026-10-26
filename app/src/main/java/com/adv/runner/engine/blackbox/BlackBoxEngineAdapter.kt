@@ -315,6 +315,23 @@ class BlackBoxEngineAdapter(
         EngineResult.Success(Unit)
     }
 
+    override suspend fun forceStop(instanceId: String): EngineResult<Unit> = withContext(Dispatchers.IO) {
+        val slot = slots[instanceId]
+            ?: return@withContext engineFailure(EngineErrorCode.UNSUPPORTED_BY_ENGINE, "实例不存在：$instanceId")
+        val failure = runCatching {
+            BlackBoxCore.get().forceStopPackage(slot.packageName)
+        }.exceptionOrNull()
+        if (failure != null) {
+            return@withContext engineFailure(
+                EngineErrorCode.INTERNAL,
+                "强制停止失败：${failure.message}",
+                failure
+            )
+        }
+        logger.info(TAG, "已强制停止 pkg=${slot.packageName} userId=${slot.userId}")
+        EngineResult.Success(Unit)
+    }
+
     override suspend fun queryState(instanceId: String): EngineResult<RuntimeProbe> =
         withContext(Dispatchers.IO) {
             val slot = slots[instanceId]

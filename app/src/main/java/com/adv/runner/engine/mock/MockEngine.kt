@@ -109,6 +109,15 @@ class MockEngine(private val logger: RunLogger) : VirtualizationEngine {
         return EngineResult.Success(Unit)
     }
 
+    override suspend fun forceStop(instanceId: String): EngineResult<Unit> {
+        if (!states.containsKey(instanceId)) {
+            return engineFailure(EngineErrorCode.UNSUPPORTED_BY_ENGINE, "实例不存在：$instanceId")
+        }
+        states[instanceId] = RuntimeState.STOPPED
+        logger.info(TAG, "MOCK forceStop instance=$instanceId")
+        return EngineResult.Success(Unit)
+    }
+
     override suspend fun queryState(instanceId: String): EngineResult<RuntimeProbe> {
         val state = states[instanceId]
             ?: return EngineResult.Success(RuntimeProbe(RuntimeState.NOT_INSTALLED, evidence = "mock: no record"))

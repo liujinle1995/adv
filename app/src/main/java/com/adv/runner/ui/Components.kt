@@ -143,6 +143,7 @@ fun InstanceRow(
     onOpen: () -> Unit,
     onLaunch: () -> Unit,
     onStop: () -> Unit,
+    onForceStop: () -> Unit,
     onDelete: () -> Unit,
     // 列表入场 stagger 序号，0 起；>=0 时启用淡入+上移入场
     staggerIndex: Int = -1
@@ -227,6 +228,13 @@ fun InstanceRow(
                     enabled = !busy,
                     modifier = Modifier.weight(1f)
                 ) { Text("停止", maxLines = 1) }
+                OutlinedButton(
+                    onClick = onForceStop,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                ) { Text("强制停止", maxLines = 1) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = onDelete,
                     enabled = !busy,

@@ -388,6 +388,7 @@ private fun HomeScreen(state: AppState, scope: CoroutineScope) {
                 onOpen = { state.openDetail(instance.id) },
                 onLaunch = { scope.launch { state.launch(instance.id) } },
                 onStop = { scope.launch { state.stop(instance.id) } },
+                onForceStop = { scope.launch { state.forceStop(instance.id) } },
                 onDelete = { state.requestDelete(instance.id) }
             )
         }
@@ -528,6 +529,11 @@ private fun DetailScreen(state: AppState, scope: CoroutineScope) {
                 enabled = !state.busy,
                 modifier = Modifier.weight(1f)
             ) { Text("停止") }
+            OutlinedButton(
+                onClick = { scope.launch { state.forceStop(instance.id) } },
+                enabled = !state.busy,
+                modifier = Modifier.weight(1f)
+            ) { Text("强制停止") }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(

@@ -59,6 +59,9 @@ interface VirtualizationEngine {
 
     suspend fun stop(instanceId: String): EngineResult<Unit>
 
+    /** 强制停止：杀目标实例的所有进程，用于「停止」无效时的兜底。 */
+    suspend fun forceStop(instanceId: String): EngineResult<Unit>
+
     suspend fun queryState(instanceId: String): EngineResult<RuntimeProbe>
 
     suspend fun clearData(instanceId: String): EngineResult<Unit>

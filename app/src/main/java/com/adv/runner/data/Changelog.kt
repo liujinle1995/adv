@@ -21,6 +21,15 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 72,
+            versionName = "0.9.8",
+            title = "实例强制停止 + 单实例运行约束",
+            highlights = listOf(
+                "新增「强制停止」按钮：杀目标实例所有进程（含 :xxx 子进程），解决普通「停止」点了没反应",
+                "同一时间只能运行一个实例：启动新实例前自动强制停掉其它仍在运行的实例",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 71,
             versionName = "0.9.7",
             title = "补齐应用依赖的初始化，启动页不再白屏、主界面能联网",

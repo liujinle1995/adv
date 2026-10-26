@@ -318,6 +318,15 @@ public class BlackBoxCore extends ClientConfiguration {
         BPackageManager.get().stopPackage(packageName, userId);
     }
 
+    /**
+     * 强制停止：杀目标包的所有宿主进程（主进程 + 所有 :xxx 子进程），
+     * 并按磁盘 proc 目录补杀注册表丢失后残留的进程。
+     * 比 {@link #stopPackage} 更彻底，用于「停止」无效时兜底。
+     */
+    public void forceStopPackage(String packageName) {
+        top.niunaijun.blackbox.core.system.BProcessManagerService.get().killAllByPackageName(packageName);
+    }
+
     public List<BUserInfo> getUsers() {
         return BUserManager.get().getUsers();
     }
