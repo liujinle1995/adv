@@ -18,6 +18,7 @@ import android.content.pm.ProviderInfo;
 import android.content.pm.ServiceInfo;
 import android.os.Binder;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.ConditionVariable;
 import android.os.Handler;
 import android.os.IBinder;
@@ -310,6 +311,18 @@ public class BActivityThread extends IBActivityThread.Stub {
     public synchronized void handleBindApplication(String packageName, String processName) {
         if (isInit())
             return;
+        // hidden API 豁免必须尽早做：后面改进程名要反射写 android.os.Process 的
+        // 隐藏字段，而 Android 9+ 默认把隐藏成员从 getDeclaredFields 里过滤掉、
+        // setAccessible 直接抛异常（实测 bindApplication 阶段改不动，要等到应用
+        // 自己初始化之后才行，那时应用早已把错误的进程名缓存下来了）。
+        try {
+            boolean ok = top.niunaijun.blackbox.utils.HiddenApiUnsealer
+                    .unseal(BlackBoxCore.getContext());
+            step("unseal=" + ok + " probe="
+                    + top.niunaijun.blackbox.utils.HiddenApiUnsealer.isUnsealed());
+        } catch (Throwable t) {
+            step("unseal FAIL " + t.getClass().getSimpleName());
+        }
         try {
             CrashHandler.create();
         } catch (Throwable ignored) {
@@ -355,8 +368,6 @@ public class BActivityThread extends IBActivityThread.Stub {
 
         VirtualRuntime.setupRuntime(processName, applicationInfo);
         step("VirtualRuntime");
-        fixCurrentProcessName(processName);
-        diagProcessIdentity(processName);
 
         BRVMRuntime.get(BRVMRuntime.get().getRuntime()).setTargetSdkVersion(applicationInfo.targetSdkVersion);
         if (BuildCompat.isS()) {
@@ -366,13 +377,25 @@ public class BActivityThread extends IBActivityThread.Stub {
         NativeCore.init(Build.VERSION.SDK_INT);
         step("NativeCore");
         try {
-            NativeCore.hookProcessName(processName);
-            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
-                    "hookProcessName ok, myProcessName=" + android.os.Process.myProcessName());
+            String status = NativeCore.hookProcessName(processName);
+            step("hookProcessName " + status);
+            // 内核 argv 已改，但 Java 侧 myProcessName() 读的是静态缓存，
+            // 这里用原生方式再写一次（Java 反射在此阶段被 hidden-api 挡住）。
+            Class<?> processCls = Class.forName("android.os.Process");
+            step("Process fields: " + NativeCore.dumpStaticFields(processCls));
+            step("setArgV0: " + NativeCore.setStaticStringField(
+                    processCls, "sArgV0", processName)
+                    + " | now=" + android.os.Process.myProcessName());
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Bind",
                     "hookProcessName FAIL " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
+        // 顺序很重要：进程名要先在内核里改正，再让任何代码去读它。
+        // Process.myProcessName() 会把读到的值缓存下来，一旦在改名之前被读过
+        // （旧版本的诊断日志就踩过这个坑），应用后面永远拿到 "宿主:p0"，
+        // 于是判定「我不是主进程」，启动页不干活、初始化走安全模式分支。
+        fixProcessNameCaches(processName, "after-hook");
+        diagProcessIdentity(processName);
         assert packageContext != null;
         IOCore.get().enableRedirect(packageContext);
         step("IOCore");
@@ -421,6 +444,11 @@ public class BActivityThread extends IBActivityThread.Stub {
             step("callApplicationOnCreate");
             onAfterApplicationOnCreate(packageName, processName, application);
 
+            // Instrumentation 那条路是否真的被系统走到并不确定（不同版本差异较大），
+            // 这里用最权威的 Application 级回调再记一遍：Activity 到底收到了哪些
+            // 生命周期。启动页卡死这类问题，这一份日志就能定性。
+            installLifecycleProbe(application);
+
             HookManager.get().checkEnv(HCallbackProxy.class);
             step("checkEnv HCallbackProxy");
         } catch (Throwable e) {
@@ -433,6 +461,82 @@ public class BActivityThread extends IBActivityThread.Stub {
 
     private static void step(String name) {
         top.niunaijun.blackbox.utils.DiagLog.log("Bind", "step " + name);
+    }
+
+    // 注：曾尝试用 Pine 直接替换 Process.myProcessName() / ActivityThread.currentProcessName()
+    // 来伪造进程名，实测在 Android 17 上会让虚拟进程立刻 native 崩溃
+    // （dropbox: data_app_native_crash），所以放弃这条路径。
+    // 当前结论：进程名在 bindApplication 阶段既写不进去（隐藏字段被过滤，
+    // 反射与 JNI 都拿不到），也不能改方法体；应用侧看到的是 "宿主:p0"。
+
+    /**
+     * 用 Application.ActivityLifecycleCallbacks 记录虚拟 Activity 的真实生命周期。
+     *
+     * 为什么不用 Instrumentation 的打点做唯一判据：不同系统版本上 ActivityThread
+     * 走哪条 Instrumentation 实例并不一致（实测 :p0 里挂的是 RouteInstrumentation，
+     * 而不是我们注入的 AppInstrumentation），所以那里没日志并不能证明回调没到。
+     * Application 层的回调是最终事实。
+     */
+    private static void installLifecycleProbe(Application application) {
+        try {
+            application.registerActivityLifecycleCallbacks(
+                    new Application.ActivityLifecycleCallbacks() {
+                        private void log(String phase, Activity a) {
+                            try {
+                                String extra = "";
+                                if ("onActivityResumed".equals(phase)
+                                        || "onActivityCreated".equals(phase)) {
+                                    android.view.View decor = a.getWindow() == null
+                                            ? null : a.getWindow().peekDecorView();
+                                    extra = " decorChildren="
+                                            + (decor instanceof android.view.ViewGroup
+                                            ? ((android.view.ViewGroup) decor).getChildCount() : -1)
+                                            + " attached=" + (decor != null && decor.isAttachedToWindow());
+                                }
+                                top.niunaijun.blackbox.utils.DiagLog.log("ALife",
+                                        phase + " " + a.getClass().getSimpleName() + extra);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+
+                        @Override
+                        public void onActivityCreated(Activity a, Bundle b) {
+                            log("onActivityCreated", a);
+                        }
+
+                        @Override
+                        public void onActivityStarted(Activity a) {
+                            log("onActivityStarted", a);
+                        }
+
+                        @Override
+                        public void onActivityResumed(Activity a) {
+                            log("onActivityResumed", a);
+                        }
+
+                        @Override
+                        public void onActivityPaused(Activity a) {
+                            log("onActivityPaused", a);
+                        }
+
+                        @Override
+                        public void onActivityStopped(Activity a) {
+                            log("onActivityStopped", a);
+                        }
+
+                        @Override
+                        public void onActivitySaveInstanceState(Activity a, Bundle b) {
+                        }
+
+                        @Override
+                        public void onActivityDestroyed(Activity a) {
+                            log("onActivityDestroyed", a);
+                        }
+                    });
+            step("lifecycleProbe installed");
+        } catch (Throwable t) {
+            step("lifecycleProbe FAIL " + t.getClass().getSimpleName());
+        }
     }
 
     /**
@@ -521,25 +625,133 @@ public class BActivityThread extends IBActivityThread.Stub {
      * 所以新系统上不依赖这里。保留是为了兼容仍使用该静态字段的旧版本。
      */
     private static void fixCurrentProcessName(String processName) {
-        try {
-            Class<?> atCls = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Field field;
+        String actual = readCmdline();
+        StringBuilder hit = new StringBuilder();
+        for (String cls : new String[]{"android.os.Process", "android.app.ActivityThread"}) {
             try {
-                field = atCls.getDeclaredField("sCurrentProcessName");
-            } catch (NoSuchFieldException e) {
-                top.niunaijun.blackbox.utils.DiagLog.log("Bind",
-                        "processName field missing, skip");
-                return;
+                Class<?> c = Class.forName(cls);
+                while (c != null && c != Object.class) {
+                    for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                        if (f.getType() != String.class
+                                || !java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                            continue;
+                        }
+                        try {
+                            f.setAccessible(true);
+                            Object v = f.get(null);
+                            if (!(v instanceof String)) {
+                                continue;
+                            }
+                            // 只改「确实是本进程名」的字段，避免误伤别的常量
+                            if (!v.equals(actual) && !"com.adv.runner:p0".equals(v)) {
+                                continue;
+                            }
+                            f.set(null, processName);
+                            if (hit.length() > 0) {
+                                hit.append(',');
+                            }
+                            hit.append(c.getSimpleName()).append('.').append(f.getName())
+                                    .append("=").append(v);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    c = c.getSuperclass();
+                }
+            } catch (Throwable ignored) {
             }
-            field.setAccessible(true);
-            Object old = field.get(null);
-            field.set(null, processName);
-            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
-                    "processName " + old + " -> " + field.get(null));
-        } catch (Throwable t) {
-            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
-                    "processName fix failed: " + t.getClass().getSimpleName());
         }
+        top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                "processName fix -> " + (hit.length() == 0 ? "no field matched" : hit.toString())
+                        + " | currentProcessName=" + currentProcessNameSafe()
+                        + " myProcessName=" + android.os.Process.myProcessName());
+    }
+
+    private static String currentProcessNameSafe() {
+        try {
+            return String.valueOf(Class.forName("android.app.ActivityThread")
+                    .getMethod("currentProcessName").invoke(null));
+        } catch (Throwable t) {
+            return "ERR(" + t.getClass().getSimpleName() + ")";
+        }
+    }
+
+    // 诊断自己的类加载器里不存在的旧值，避免写死字符串。
+    private static final String[] OLD_PROCESS_NAMES = {
+            "com.adv.runner", "com.adv.runner:p0", "com.adv.runner:black"
+    };
+
+    /**
+     * 把「已经缓存了宿主进程名」的静态字段改写掉。
+     *
+     * Process.myProcessName() / ActivityThread.currentProcessName() 在部分系统版本上
+     * 会把第一次读到的值存进静态字段。只要有任何代码在改内核 cmdline 之前读过一次
+     * （诊断日志最容易踩），应用之后拿到的永远是 "宿主:p0"，于是把自己当成子进程：
+     * 启动页不执行跳转逻辑、初始化框架走安全模式分支并死等。
+     *
+     * 这里不猜字段名，直接扫这几个系统类里的静态 String，命中旧值就改写并记下来。
+     */
+    public static void fixProcessNameCaches(String virtualName, String tag) {
+        StringBuilder hit = new StringBuilder();
+        // 已确认（Android 17 实测）：Process.myProcessName() 与
+        // ActivityThread.currentProcessName() 都走 android.os.Process.sArgV0。
+        // 这个字段一旦被填成 "宿主:p0"，后面怎么改内核 cmdline 都没用，
+        // 所以这里无条件覆盖，而不是等它变成旧值再改。
+        try {
+            Class<?> processCls = Class.forName("android.os.Process");
+            java.lang.reflect.Field f = processCls.getDeclaredField("sArgV0");
+            f.setAccessible(true);
+            Object old = f.get(null);
+            f.set(null, virtualName);
+            hit.append("sArgV0=").append(old).append("->").append(virtualName);
+        } catch (Throwable ignored) {
+        }
+        for (String cls : new String[]{
+                "android.os.Process", "android.app.ActivityThread",
+                "android.ddm.DdmHandleAppName", "android.app.Application"}) {
+            try {
+                Class<?> c = Class.forName(cls);
+                while (c != null && c != Object.class) {
+                    for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                        if (f.getType() != String.class
+                                || !java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                            continue;
+                        }
+                        try {
+                            f.setAccessible(true);
+                            Object v = f.get(null);
+                            if (!(v instanceof String)) {
+                                continue;
+                            }
+                            String s = (String) v;
+                            boolean stale = false;
+                            for (String old : OLD_PROCESS_NAMES) {
+                                if (old.equals(s)) {
+                                    stale = true;
+                                    break;
+                                }
+                            }
+                            if (!stale || s.equals(virtualName)) {
+                                continue;
+                            }
+                            f.set(null, virtualName);
+                            if (hit.length() > 0) {
+                                hit.append(',');
+                            }
+                            hit.append(c.getSimpleName()).append('.').append(f.getName())
+                                    .append(':').append(s);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    c = c.getSuperclass();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                "nameCache[" + tag + "] "
+                        + (hit.length() == 0 ? "none" : hit.toString())
+                        + " | now=" + android.os.Process.myProcessName()
+                        + " cur=" + currentProcessNameSafe());
     }
 
     /** 确认 LoadedApk 的 ClassLoader 能否真正加载虚拟应用的 Application 类。 */

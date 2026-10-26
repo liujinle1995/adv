@@ -41,7 +41,13 @@ public class NativeCore {
      * Android 17 已移除 Process.setArgV0，因此改由 native 替换
      * nativeMyProcessName 的实现，不依赖 ArtMethod 布局。
      */
-    public static native void hookProcessName(String processName);
+    public static native String hookProcessName(String processName);
+
+    /** 列出某个类声明的字段（名字+类型），用于排查隐藏 API 在 JNI 侧是否可见。 */
+    public static native String dumpStaticFields(Class<?> cls);
+
+    /** 直接写某个类的静态 String 字段，绕开 Java 反射的 hidden-api 限制。 */
+    public static native String setStaticStringField(Class<?> cls, String fieldName, String value);
 
     public static native void enableIO();
 

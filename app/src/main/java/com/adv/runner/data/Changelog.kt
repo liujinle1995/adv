@@ -21,6 +21,103 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 66,
+            versionName = "0.9.2",
+            title = "移除会崩溃的进程名替换方案",
+            highlights = listOf(
+                "撤掉在 Android 17 上会导致原生崩溃的进程名伪造路径",
+                "恢复稳定的启动流程，保留完整诊断信息",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 65,
+            versionName = "0.9.1",
+            title = "方法级替换进程名查询",
+            highlights = listOf(
+                "直接替换系统的进程名查询方法，让应用从第一行代码就拿到正确名字",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 64,
+            versionName = "0.9.0",
+            title = "启动最早期解除隐藏 API 限制",
+            highlights = listOf(
+                "虚拟应用启动前先解除隐藏接口限制，进程名修正才能真正生效",
+                "针对启动页停在原地不再前进的问题",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 63,
+            versionName = "0.8.9",
+            title = "原生方式写入进程名缓存",
+            highlights = listOf(
+                "改由原生接口写入系统进程名字段，绕开反射限制",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 62,
+            versionName = "0.8.8",
+            title = "进程名修正可见化",
+            highlights = listOf(
+                "原生层进程名修正会回报实际执行结果，便于确认是否生效",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 61,
+            versionName = "0.8.7",
+            title = "在原生层改正进程名缓存",
+            highlights = listOf(
+                "启动最早期就用原生调用覆盖系统缓存的进程名，绕开反射限制",
+                "虚拟应用从第一行代码起就认为自己是主进程",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 60,
+            versionName = "0.8.6",
+            title = "启动即修正进程身份",
+            highlights = listOf(
+                "定位到系统缓存的进程名称字段，启动时立刻覆盖",
+                "应用不再把自己误判成子进程，启动页可正常跳转",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 59,
+            versionName = "0.8.5",
+            title = "修正虚拟应用看到的自身进程名",
+            highlights = listOf(
+                "先改正进程名再读取，避免应用把自己误判成子进程",
+                "已缓存的旧进程名会被自动改写并记录",
+                "修复部分应用停在启动页不跳转的问题",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 58,
+            versionName = "0.8.4",
+            title = "补齐生命周期探针",
+            highlights = listOf(
+                "改用系统级生命周期回调记录虚拟页面状态，判据更可靠",
+                "针对「停在启动页不跳转」继续定位",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 57,
+            versionName = "0.8.3",
+            title = "记录活动生命周期回调",
+            highlights = listOf(
+                "记录虚拟应用每个页面收到的 onCreate/onStart/onResume 等回调，便于定位启动页不跳转",
+                "同时记录内容视图的子控件数量，判断页面是否真的渲染完成",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 56,
+            versionName = "0.8.2",
+            title = "启动卡顿诊断更细",
+            highlights = listOf(
+                "启动后分三个时间点抓取全部线程快照，能看到启动页之后卡在哪",
+                "进程名修正改为扫描系统字段，兼容不同系统版本",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 55,
             versionName = "0.8.1",
             title = "底层改进程标识",

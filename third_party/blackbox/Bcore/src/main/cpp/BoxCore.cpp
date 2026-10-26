@@ -205,19 +205,69 @@ static void overwriteCmdline(const char *name) {
     ALOGD("overwriteCmdline ok -> %s", name);
 }
 
-void hookProcessName(JNIEnv *env, jclass, jstring java_name) {
+jstring hookProcessName(JNIEnv *env, jclass, jstring java_name) {
+    std::string status;
     if (java_name == nullptr) {
-        return;
+        return env->NewStringUTF("java_name null");
     }
     const char *name = env->GetStringUTFChars(java_name, nullptr);
     if (name == nullptr) {
         env->ExceptionClear();
-        return;
+        return env->NewStringUTF("name null");
     }
     g_virtualProcessName = name;
 
     // 一：改内核 argv，让 /proc/self/cmdline 与 Process.myProcessName() 一起变。
     overwriteCmdline(name);
+
+    // 二：直接写 android.os.Process.sArgV0。
+    // 这是 Android 17 上 myProcessName()/ActivityThread.currentProcessName()
+    // 真正读取的缓存字段（实测：内核 cmdline 已经是虚拟应用名，Java 侧仍返回
+    // "宿主:p0"，就是因为它读的是这个静态缓存）。
+    // 走 JNI 而不是 Java 反射：bindApplication 阶段 Java 反射受 hidden-api 限制，
+    // setAccessible 会抛异常（实测那一刻改不动，要等到 12 秒后才成功）。
+    {
+        jclass processCls = env->FindClass("android/os/Process");
+        if (processCls == nullptr) {
+            env->ExceptionClear();
+            status += "Process=null ";
+        } else {
+            jfieldID fid = env->GetStaticFieldID(processCls, "sArgV0",
+                                                 "Ljava/lang/String;");
+            if (fid == nullptr) {
+                env->ExceptionClear();
+                status += "field=null ";
+            } else {
+                auto oldVal = reinterpret_cast<jstring>(
+                        env->GetStaticObjectField(processCls, fid));
+                if (oldVal != nullptr) {
+                    const char *oldChars = env->GetStringUTFChars(oldVal, nullptr);
+                    status += std::string("old=") + (oldChars ? oldChars : "?") + " ";
+                    if (oldChars) env->ReleaseStringUTFChars(oldVal, oldChars);
+                    env->DeleteLocalRef(oldVal);
+                } else {
+                    status += "old=null ";
+                    env->ExceptionClear();
+                }
+                jstring argV0 = env->NewStringUTF(name);
+                if (argV0 != nullptr) {
+                    env->SetStaticObjectField(processCls, fid, argV0);
+                    env->DeleteLocalRef(argV0);
+                }
+                auto afterVal = reinterpret_cast<jstring>(
+                        env->GetStaticObjectField(processCls, fid));
+                if (afterVal != nullptr) {
+                    const char *afterChars = env->GetStringUTFChars(afterVal, nullptr);
+                    status += std::string("new=") + (afterChars ? afterChars : "?") + " ";
+                    if (afterChars) env->ReleaseStringUTFChars(afterVal, afterChars);
+                    env->DeleteLocalRef(afterVal);
+                } else {
+                    status += "new=null ";
+                    env->ExceptionClear();
+                }
+            }
+        }
+    }
 
     env->ReleaseStringUTFChars(java_name, name);
 
@@ -227,7 +277,7 @@ void hookProcessName(JNIEnv *env, jclass, jstring java_name) {
     jclass processCls = env->FindClass("android/os/Process");
     if (processCls == nullptr) {
         env->ExceptionClear();
-        return;
+        return env->NewStringUTF(status.c_str());
     }
     JNINativeMethod method = {
             const_cast<char *>("nativeMyProcessName"),
@@ -237,7 +287,106 @@ void hookProcessName(JNIEnv *env, jclass, jstring java_name) {
     if (env->RegisterNatives(processCls, &method, 1) < 0) {
         env->ExceptionClear();
         ALOGE("hookProcessName: RegisterNatives(nativeMyProcessName) failed");
+        status += "regNative=fail ";
     }
+    return env->NewStringUTF(status.c_str());
+}
+
+
+// ---------------------------------------------------------------------------
+// 进程名缓存（android.os.Process.sArgV0）相关工具
+//
+// 为什么要专门写这两个函数：bindApplication 阶段 Java 反射受 hidden-api 限制
+// （setAccessible 抛异常），而 JNI 里 FindClass("android/os/Process") 之后
+// GetStaticFieldID 却拿不到 sArgV0。这里改成由 Java 侧把 Class 对象传进来，
+// 并且额外提供「列出所有字段名+类型」的诊断，避免继续在两个世界之间猜。
+// ---------------------------------------------------------------------------
+jstring dumpStaticFields(JNIEnv *env, jclass, jclass target) {
+    std::string out;
+    if (target == nullptr) {
+        return env->NewStringUTF("target=null");
+    }
+    jclass classCls = env->FindClass("java/lang/Class");
+    if (classCls == nullptr) {
+        env->ExceptionClear();
+        return env->NewStringUTF("Class=null");
+    }
+    jmethodID getDeclaredFields = env->GetMethodID(
+            classCls, "getDeclaredFields", "()[Ljava/lang/reflect/Field;");
+    if (getDeclaredFields == nullptr) {
+        env->ExceptionClear();
+        return env->NewStringUTF("getDeclaredFields=null");
+    }
+    jobjectArray fields = reinterpret_cast<jobjectArray>(
+            env->CallObjectMethod(target, getDeclaredFields));
+    if (fields == nullptr) {
+        env->ExceptionClear();
+        return env->NewStringUTF("fields=null");
+    }
+    jclass fieldCls = env->FindClass("java/lang/reflect/Field");
+    jmethodID getName = env->GetMethodID(fieldCls, "getName", "()Ljava/lang/String;");
+    jmethodID getType = env->GetMethodID(fieldCls, "getType",
+                                         "()Ljava/lang/Class;");
+    jclass klassCls = env->FindClass("java/lang/Class");
+    jmethodID clsGetName = env->GetMethodID(klassCls, "getName",
+                                            "()Ljava/lang/String;");
+    jmethodID isStatic = env->GetMethodID(fieldCls, "getModifiers", "()I");
+
+    jsize count = env->GetArrayLength(fields);
+    for (jsize i = 0; i < count; i++) {
+        jobject f = env->GetObjectArrayElement(fields, i);
+        if (f == nullptr) continue;
+        auto n = reinterpret_cast<jstring>(env->CallObjectMethod(f, getName));
+        jobject t = env->CallObjectMethod(f, getType);
+        auto tn = reinterpret_cast<jstring>(env->CallObjectMethod(t, clsGetName));
+        jint mod = env->CallIntMethod(f, isStatic);
+        const char *nc = n ? env->GetStringUTFChars(n, nullptr) : nullptr;
+        const char *tc = tn ? env->GetStringUTFChars(tn, nullptr) : nullptr;
+        if (out.size() < 1500) {
+            out += (mod & 0x0008) ? "S:" : "I:";
+            out += nc ? nc : "?";
+            out += ":";
+            out += tc ? tc : "?";
+            out += " ";
+        }
+        if (nc) env->ReleaseStringUTFChars(n, nc);
+        if (tc) env->ReleaseStringUTFChars(tn, tc);
+        env->DeleteLocalRef(f);
+    }
+    env->DeleteLocalRef(fields);
+    return env->NewStringUTF(out.c_str());
+}
+
+jstring setStaticStringField(JNIEnv *env, jclass, jclass target, jstring fieldName,
+                             jstring value) {
+    if (target == nullptr || fieldName == nullptr || value == nullptr) {
+        return env->NewStringUTF("args=null");
+    }
+    const char *fname = env->GetStringUTFChars(fieldName, nullptr);
+    if (fname == nullptr) {
+        env->ExceptionClear();
+        return env->NewStringUTF("fname=null");
+    }
+    jfieldID fid = env->GetStaticFieldID(target, fname, "Ljava/lang/String;");
+    if (fid == nullptr) {
+        env->ExceptionClear();
+        env->ReleaseStringUTFChars(fieldName, fname);
+        return env->NewStringUTF("field=null");
+    }
+    env->SetStaticObjectField(target, fid, value);
+    auto after = reinterpret_cast<jstring>(env->GetStaticObjectField(target, fid));
+    std::string out = "ok ";
+    if (after != nullptr) {
+        const char *ac = env->GetStringUTFChars(after, nullptr);
+        out += ac ? ac : "?";
+        if (ac) env->ReleaseStringUTFChars(after, ac);
+        env->DeleteLocalRef(after);
+    } else {
+        out += "null";
+        env->ExceptionClear();
+    }
+    env->ReleaseStringUTFChars(fieldName, fname);
+    return env->NewStringUTF(out.c_str());
 }
 
 static JNINativeMethod gMethods[] = {
@@ -245,7 +394,9 @@ static JNINativeMethod gMethods[] = {
         {"addIORule",      "(Ljava/lang/String;Ljava/lang/String;)V", (void *) addIORule},
         {"enableIO",       "()V",                                     (void *) enableIO},
         {"init",           "(I)V",                                    (void *) init},
-        {"hookProcessName", "(Ljava/lang/String;)V",                  (void *) hookProcessName},
+        {"hookProcessName", "(Ljava/lang/String;)Ljava/lang/String;",   (void *) hookProcessName},
+        {"dumpStaticFields", "(Ljava/lang/Class;)Ljava/lang/String;",       (void *) dumpStaticFields},
+        {"setStaticStringField", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *) setStaticStringField},
 };
 
 int registerNativeMethods(JNIEnv *env, const char *className,

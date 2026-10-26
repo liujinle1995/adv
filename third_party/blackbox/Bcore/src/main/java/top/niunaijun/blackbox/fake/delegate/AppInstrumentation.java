@@ -142,12 +142,81 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     public void callActivityOnCreate(Activity activity, Bundle icicle, PersistableBundle persistentState) {
         checkActivity(activity);
         super.callActivityOnCreate(activity, icicle, persistentState);
+        logDecor(activity, "onCreate");
     }
 
     @Override
     public void callActivityOnCreate(Activity activity, Bundle icicle) {
         checkActivity(activity);
         super.callActivityOnCreate(activity, icicle);
+        logDecor(activity, "onCreate");
+    }
+
+    // 启动页卡死时，「应用到底收到了哪些生命周期回调」是最直接的判据：
+    // 只有 onCreate 没有 onResume，说明跳转条件（首帧/resume 回调）永远不成立。
+    @Override
+    public void callActivityOnStart(Activity activity) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                "onStart " + activity.getClass().getSimpleName());
+        super.callActivityOnStart(activity);
+    }
+
+    @Override
+    public void callActivityOnResume(Activity activity) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                "onResume " + activity.getClass().getSimpleName());
+        super.callActivityOnResume(activity);
+    }
+
+    @Override
+    public void callActivityOnPostCreate(Activity activity, Bundle savedInstanceState) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                "onPostCreate " + activity.getClass().getSimpleName());
+        super.callActivityOnPostCreate(activity, savedInstanceState);
+    }
+
+    @Override
+    public void callActivityOnPause(Activity activity) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                "onPause " + activity.getClass().getSimpleName());
+        super.callActivityOnPause(activity);
+    }
+
+    @Override
+    public void callActivityOnStop(Activity activity) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                "onStop " + activity.getClass().getSimpleName());
+        super.callActivityOnStop(activity);
+    }
+
+    @Override
+    public void callActivityOnDestroy(Activity activity) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                "onDestroy " + activity.getClass().getSimpleName());
+        super.callActivityOnDestroy(activity);
+    }
+
+    /** 记下内容视图的规模：启动页若只有主题背景、内容区为空，说明它还在等初始化。 */
+    private static void logDecor(Activity activity, String phase) {
+        try {
+            android.view.View decor = activity.getWindow() == null
+                    ? null : activity.getWindow().peekDecorView();
+            int decorChildren = decor instanceof android.view.ViewGroup
+                    ? ((android.view.ViewGroup) decor).getChildCount() : -1;
+            int contentChildren = -1;
+            try {
+                android.view.View content = activity.findViewById(android.R.id.content);
+                if (content instanceof android.view.ViewGroup) {
+                    contentChildren = ((android.view.ViewGroup) content).getChildCount();
+                }
+            } catch (Throwable ignored) {
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                    phase + " done " + activity.getClass().getSimpleName()
+                            + " decorChildren=" + decorChildren
+                            + " contentChildren=" + contentChildren);
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override
@@ -174,41 +243,63 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             final Thread main = android.os.Looper.getMainLooper().getThread();
             final String name = app == null ? "null" : app.getClass().getName();
             Thread watcher = new Thread(() -> {
-                try {
-                    Thread.sleep(12000);
-                } catch (InterruptedException ignored) {
-                    return;
-                }
-                try {
-                    StringBuilder sb = new StringBuilder("STACK DUMP (onCreate of ")
-                            .append(name).append(")");
-                    java.util.Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
-                    int dumped = 0;
-                    for (java.util.Map.Entry<Thread, StackTraceElement[]> e : all.entrySet()) {
-                        Thread t = e.getKey();
-                        if (t == null || t == Thread.currentThread()) {
-                            continue;
-                        }
-                        if (dumped++ >= 60) {
-                            break;
-                        }
-                        sb.append("\n  [").append(t.getName()).append("] ").append(t.getState())
-                                .append(t == main ? " *MAIN*" : "");
-                        StackTraceElement[] st = e.getValue();
-                        int limit = Math.min(st.length, 18);
-                        for (int i = 0; i < limit; i++) {
-                            sb.append("\n      at ").append(st[i]);
-                        }
-                        if (st.length > limit) {
-                            sb.append("\n      ... ").append(st.length - limit).append(" more");
-                        }
+                // 分多个时间点各抓一次：onCreate 卡住时第一份就够定位；
+                // 若 onCreate 已返回但界面还停在启动页（子任务卡住），
+                // 也要能拿到一份 onCreate 之后的线程快照，否则无从下手。
+                for (int round = 0; round < 3; round++) {
+                    try {
+                        Thread.sleep(round == 0 ? 12000 : 25000);
+                    } catch (InterruptedException ignored) {
+                        return;
                     }
-                    top.niunaijun.blackbox.utils.DiagLog.log("Inst", sb.toString());
-                } catch (Throwable ignored) {
+                    dumpOnce(name, main, round);
                 }
             }, "adv-stack-watch");
             watcher.setDaemon(true);
             watcher.start();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void dumpOnce(String name, Thread main, int round) {
+        try {
+            // 每轮都尝试修一次进程名缓存：首次读取如果发生在改名之前，
+            // 缓存里就是宿主名，越早改写越有机会让应用拿到正确身份。
+            try {
+                String virtualName = top.niunaijun.blackbox.core.env.VirtualRuntime
+                        .getInitialPackageName();
+                if (virtualName != null) {
+                    top.niunaijun.blackbox.app.BActivityThread
+                            .fixProcessNameCaches(virtualName, "probe#" + round);
+                }
+            } catch (Throwable ignored) {
+            }
+            StringBuilder sb = new StringBuilder("STACK DUMP#").append(round)
+                    .append(" (onCreate of ").append(name)
+                    .append(") progName=").append(android.os.Process.myProcessName())
+                    .append(" mainState=").append(main.getState());
+            java.util.Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+            int dumped = 0;
+            for (java.util.Map.Entry<Thread, StackTraceElement[]> e : all.entrySet()) {
+                Thread t = e.getKey();
+                if (t == null || t == Thread.currentThread()) {
+                    continue;
+                }
+                if (dumped++ >= 80) {
+                    break;
+                }
+                sb.append("\n  [").append(t.getName()).append("] ").append(t.getState())
+                        .append(t == main ? " *MAIN*" : "");
+                StackTraceElement[] st = e.getValue();
+                int limit = Math.min(st.length, 18);
+                for (int i = 0; i < limit; i++) {
+                    sb.append("\n      at ").append(st[i]);
+                }
+                if (st.length > limit) {
+                    sb.append("\n      ... ").append(st.length - limit).append(" more");
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Inst", sb.toString());
         } catch (Throwable ignored) {
         }
     }
