@@ -155,8 +155,62 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         top.niunaijun.blackbox.utils.DiagLog.log("Inst",
                 "callApplicationOnCreate " + (app == null ? "null" : app.getClass().getName())
                         + " pid=" + android.os.Process.myPid());
+        dumpMainStackIfStuck(app);
         checkHCallback();
         super.callApplicationOnCreate(app);
+        top.niunaijun.blackbox.utils.DiagLog.log("Inst", "application onCreate RETURNED");
+    }
+
+    /**
+     * 加固壳（如红果的 MuteApplicationStub）或大型框架（ByteDance lego 初始化）
+     * 在 onCreate 里会阻塞等待子任务，此时没有 root 拿不到 tombstone、logcat 又被
+     * ROM 屏蔽，只能从进程内部自行上报。
+     *
+     * 起守护线程，12 秒后把**所有线程**的栈写进诊断日志：主线程往往只是
+     * 在 CountDownLatch.await 上等，真正卡住的子任务线程必须一起看才定位得到。
+     */
+    private static void dumpMainStackIfStuck(Application app) {
+        try {
+            final Thread main = android.os.Looper.getMainLooper().getThread();
+            final String name = app == null ? "null" : app.getClass().getName();
+            Thread watcher = new Thread(() -> {
+                try {
+                    Thread.sleep(12000);
+                } catch (InterruptedException ignored) {
+                    return;
+                }
+                try {
+                    StringBuilder sb = new StringBuilder("STACK DUMP (onCreate of ")
+                            .append(name).append(")");
+                    java.util.Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+                    int dumped = 0;
+                    for (java.util.Map.Entry<Thread, StackTraceElement[]> e : all.entrySet()) {
+                        Thread t = e.getKey();
+                        if (t == null || t == Thread.currentThread()) {
+                            continue;
+                        }
+                        if (dumped++ >= 60) {
+                            break;
+                        }
+                        sb.append("\n  [").append(t.getName()).append("] ").append(t.getState())
+                                .append(t == main ? " *MAIN*" : "");
+                        StackTraceElement[] st = e.getValue();
+                        int limit = Math.min(st.length, 18);
+                        for (int i = 0; i < limit; i++) {
+                            sb.append("\n      at ").append(st[i]);
+                        }
+                        if (st.length > limit) {
+                            sb.append("\n      ... ").append(st.length - limit).append(" more");
+                        }
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("Inst", sb.toString());
+                } catch (Throwable ignored) {
+                }
+            }, "adv-stack-watch");
+            watcher.setDaemon(true);
+            watcher.start();
+        } catch (Throwable ignored) {
+        }
     }
 
     public Activity newActivity(ClassLoader cl, String className, Intent intent) throws InstantiationException, IllegalAccessException, ClassNotFoundException {

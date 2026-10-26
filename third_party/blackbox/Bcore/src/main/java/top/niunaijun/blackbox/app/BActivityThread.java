@@ -355,6 +355,7 @@ public class BActivityThread extends IBActivityThread.Stub {
 
         VirtualRuntime.setupRuntime(processName, applicationInfo);
         step("VirtualRuntime");
+        fixCurrentProcessName(processName);
 
         BRVMRuntime.get(BRVMRuntime.get().getRuntime()).setTargetSdkVersion(applicationInfo.targetSdkVersion);
         if (BuildCompat.isS()) {
@@ -425,6 +426,41 @@ public class BActivityThread extends IBActivityThread.Stub {
         top.niunaijun.blackbox.utils.DiagLog.log("Bind", "step " + name);
     }
 
+    /**
+     * 尝试让 ActivityThread.currentProcessName() 返回虚拟应用的进程名。
+     *
+     * 动机：:p0 进程是宿主 fork 出来的，系统在进程启动时把进程名设成了
+     * "com.adv.runner:p0"。部分应用靠这个值判断「我是不是主进程」来决定要不要
+     * 初始化主进程任务，判定为否就可能跳过，而主线程仍在等那批任务完成 ——
+     * 表现为进程活着、CPU 0%、Application.onCreate 永不返回。
+     *
+     * 注意：Android 17 上 ActivityThread 已经没有 sCurrentProcessName 字段
+     * （此处会打印 field missing 后跳过）。系统实际走的是
+     * mBoundApplication.processName，我们在 bindData 里已经设对了，
+     * 所以新系统上不依赖这里。保留是为了兼容仍使用该静态字段的旧版本。
+     */
+    private static void fixCurrentProcessName(String processName) {
+        try {
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Field field;
+            try {
+                field = atCls.getDeclaredField("sCurrentProcessName");
+            } catch (NoSuchFieldException e) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                        "processName field missing, skip");
+                return;
+            }
+            field.setAccessible(true);
+            Object old = field.get(null);
+            field.set(null, processName);
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                    "processName " + old + " -> " + field.get(null));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind",
+                    "processName fix failed: " + t.getClass().getSimpleName());
+        }
+    }
+
     /** 确认 LoadedApk 的 ClassLoader 能否真正加载虚拟应用的 Application 类。 */
     private static void diagLoadedApk(Object loadedApk, ApplicationInfo applicationInfo) {
         try {
@@ -441,6 +477,13 @@ public class BActivityThread extends IBActivityThread.Stub {
                 }
             }
             top.niunaijun.blackbox.utils.DiagLog.log("Bind", sb.toString());
+            // 加固壳几乎都要 System.loadLibrary，so 没解压出来就会在 onCreate 里
+            // 反复重试或直接挂住，把目录实际情况记下来省掉一轮猜测。
+            java.io.File libDir = new java.io.File(applicationInfo.nativeLibraryDir);
+            String[] libs = libDir.isDirectory() ? libDir.list() : null;
+            top.niunaijun.blackbox.utils.DiagLog.log("Bind", "libDir=" + applicationInfo.nativeLibraryDir
+                    + " isDir=" + libDir.isDirectory()
+                    + " libs=" + (libs == null ? "n/a" : java.util.Arrays.toString(libs)));
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Bind", "diagLoadedApk ERR " + t);
         }

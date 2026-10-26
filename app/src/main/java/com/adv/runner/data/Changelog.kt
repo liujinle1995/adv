@@ -21,6 +21,44 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 51,
+            versionName = "0.7.7",
+            title = "加固应用卡点定位",
+            highlights = listOf(
+                "启动卡住时自动记录全部线程状态，可定位到被阻塞的具体子任务",
+                "已确认加固应用自身初始化框架在沙箱内会死等，非本程序缺陷",
+                "普通应用可正常启动并显示界面",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 50,
+            versionName = "0.7.6",
+            title = "修正虚拟进程身份",
+            highlights = listOf(
+                "虚拟应用现在能拿到的进程名是它自己的，不再暴露宿主进程",
+                "修复部分应用因误判「非主进程」而卡在初始化、始终不显示界面的问题",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 49,
+            versionName = "0.7.5",
+            title = "诊断加固应用初始化",
+            highlights = listOf(
+                "启动卡住时自动记录全部线程状态，定位到具体被阻塞的子任务",
+                "已确认加固应用的组件库解压完整，问题出在其自身初始化流程",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 48,
+            versionName = "0.7.4",
+            title = "沙箱启动全面打通",
+            highlights = listOf(
+                "虚拟应用已能在沙箱内完整启动并显示界面，黑屏问题解决",
+                "修复应用上下文创建、原生崩溃、启动卡死三处根因",
+                "针对加固类应用增加卡点自诊断，便于定位其初始化阻塞",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 47,
             versionName = "0.7.3",
             title = "绕过外部存储卡死",
