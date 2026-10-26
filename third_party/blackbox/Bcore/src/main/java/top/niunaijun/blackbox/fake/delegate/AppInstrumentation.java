@@ -774,6 +774,11 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             probeSafeMode(app);
             clearSafeModeIfRequested(app);
             wakeExecutors(app);
+            // 必须在应用自己的 onCreate 之前配好 Keva 的执行器：
+            // KevaImpl.<clinit> 首次执行时若 KevaBuilder.mExecutor 非空会直接采用，
+            // 否则兜底建一个在沙箱里不消费任务的 PThreadPoolExecutorDelegate，
+            // 导致 KevaFuture.get() 永久阻塞（ttnet 的 ClientKeyManager 卡死）。
+            preConfigureKeva(app);
         }
         dumpMainStackIfStuck(app);
         checkHCallback();
@@ -796,6 +801,46 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     }
 
     /**
+     * 在应用 onCreate 之前，给 KevaBuilder 塞一个能跑任务的 executor。
+     *
+     * KevaImpl.<clinit>（字节的 KV 库，首次使用时才初始化）会：
+     *   getInstance() 拿 builder → clearInstance() 清空静态实例 →
+     *   读 builder.mExecutor，非空则赋给 sExecutor，否则兜底建 PThreadPoolExecutorDelegate。
+     *
+     * 那个兜底线程池在沙箱里不消费任务，会让 KevaFuture.get() 永久阻塞。所以这里
+     * 抢在应用代码触发 KevaImpl 之前，先把 builder 配好。
+     */
+    private static void preConfigureKeva(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> kb = Class.forName("com.bytedance.keva.KevaBuilder", false, cl);
+            Object builder = kb.getMethod("getInstance").invoke(null);
+            if (builder == null) {
+                builder = kb.getDeclaredConstructor().newInstance();
+            }
+            java.util.concurrent.ExecutorService ex =
+                    java.util.concurrent.Executors.newCachedThreadPool();
+            try {
+                kb.getMethod("setExecutor", java.util.concurrent.Executor.class)
+                        .invoke(builder, ex);
+            } catch (Throwable ignored) {
+                java.lang.reflect.Field mf = kb.getDeclaredField("mExecutor");
+                mf.setAccessible(true);
+                mf.set(builder, ex);
+            }
+            // 塞回静态实例，供 KevaImpl.<clinit> 的 getInstance() 取用
+            java.lang.reflect.Field mi = kb.getDeclaredField("mInstance");
+            mi.setAccessible(true);
+            mi.set(null, builder);
+            top.niunaijun.blackbox.utils.DiagLog.log("Keva",
+                    "pre-configured builder executor");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Keva",
+                    "pre-config failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /**
      * 补一次字节 RPC 框架的初始化。
      *
      * 反编译（classes26.dex）确认：真正被混淆掉的入口是
@@ -813,11 +858,6 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      */
     private static void ensureRpcInit(final Application app) {
         try {
-            // Keva（字节的 KV 库）的仓库加载任务跑在它自己的 Executor 上。
-            // 沙箱里那个 Executor 不消费任务，于是所有 KevaFuture.getXxx 都永久阻塞：
-            // ttnet 的 ClientKeyManager 正卡在这儿，连带整个 HTTP 初始化起不来
-            // （表现为主界面「网络出错，请点击重试」）。
-            fixKevaExecutor(app);
             Thread t = new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -835,26 +875,6 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             top.niunaijun.blackbox.utils.DiagLog.log("Boot",
                     "init joined=" + !t.isAlive());
         } catch (Throwable ignored) {
-        }
-    }
-
-    /** 把 Keva 的仓库加载执行器换成一个真的会跑任务的线程池。 */
-    private static void fixKevaExecutor(Application app) {
-        try {
-            ClassLoader cl = app.getClassLoader();
-            Class<?> kb = cl.loadClass("com.bytedance.keva.KevaBuilder");
-            Object builder = kb.getMethod("getInstance").invoke(null);
-            java.util.concurrent.ExecutorService ex =
-                    java.util.concurrent.Executors.newCachedThreadPool();
-            java.lang.reflect.Field f = kb.getDeclaredField("mExecutor");
-            f.setAccessible(true);
-            Object old = f.get(builder);
-            f.set(builder, ex);
-            top.niunaijun.blackbox.utils.DiagLog.log("Keva",
-                    "executor " + (old == null ? "null" : old.getClass().getName()) + " -> cached");
-        } catch (Throwable t) {
-            top.niunaijun.blackbox.utils.DiagLog.log("Keva",
-                    "fix executor failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
         }
     }
 
@@ -1020,6 +1040,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
                         "p2.e() failed: " + cause.getClass().getName() + " " + cause.getMessage());
             }
+
+            // 探针：读 client_key_config 仓库，判断 KMS 密钥是否为空（空的请求头会被服务端拒）
+            probeClientKey(app);
             if (isRpcReady(app)) return;
 
             // 2) 最后兜底：最小初始化，至少让门面方法不再抛「未初始化」
@@ -1049,6 +1072,31 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Rpc",
                     "init crashed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /** 探针：读 ttnet 的 client_key_config 仓库，看 KMS 密钥是否为空。 */
+    private static void probeClientKey(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> keva = cl.loadClass("com.bytedance.keva.Keva");
+            Object repo = keva.getMethod("getRepo", String.class, int.class)
+                    .invoke(null, "ttnet_client_key_config", 1);
+            if (repo == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Key", "repo null");
+                return;
+            }
+            String ck = String.valueOf(repo.getClass().getMethod("getString",
+                    String.class, String.class).invoke(repo, "client_key", ""));
+            String kv = String.valueOf(repo.getClass().getMethod("getString",
+                    String.class, String.class).invoke(repo, "kms_version", ""));
+            String sid = String.valueOf(repo.getClass().getMethod("getString",
+                    String.class, String.class).invoke(repo, "session_id", ""));
+            top.niunaijun.blackbox.utils.DiagLog.log("Key",
+                    "client_key.len=" + ck.length() + " kms=" + kv + " sid=" + sid);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Key",
+                    "probe failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
         }
     }
 
