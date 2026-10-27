@@ -1065,6 +1065,22 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 Class<?> nc = cl.loadClass("com.bytedance.common.utility.NetworkClient");
                 Object client = cl.loadClass("com.dragon.read.app.XsSSNetworkClient")
                         .getDeclaredConstructor().newInstance();
+                // 请求级埋点：NetworkClient 是接口时，套一层代理，把每次请求的
+                // URL / 结果长度 / 异常全部记下来。图片、播放器、接口都会经过它，
+                // 这是唯一能看到"到底有没有发请求"的抓手。
+                if (nc.isInterface()) {
+                    try {
+                        client = java.lang.reflect.Proxy.newProxyInstance(
+                                cl, new Class<?>[]{nc}, new HttpTraceHandler(client));
+                        top.niunaijun.blackbox.utils.DiagLog.log("Http", "NetworkClient wrapped (trace)");
+                    } catch (Throwable t) {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                                "wrap failed: " + t.getClass().getSimpleName());
+                    }
+                } else {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                            "NetworkClient is class, no trace wrapper");
+                }
                 boolean ok = false;
                 for (java.lang.reflect.Method m : nc.getMethods()) {
                     if (!m.getName().equals("setDefault") || m.getParameterCount() != 1) continue;
@@ -1455,10 +1471,54 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         logExecutorState(app);
         logNetworkState(app);
         probeAppHttp(app);
+        logFrescoState(app);
         logMappedLibs();
+        logNativeThreads();
         logAllThreads(app);
         exportAppSelfLogs(app);
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump end ===");
+    }
+
+    /**
+     * 看 Fresco 图片管线是不是被暂停了。
+     *
+     * `ImagePipeline.pause()` 一旦被调用且没有 resume（例如应用监听前后台、
+     * 省流模式、低内存时暂停），之后所有图片请求只会排队不入队执行 ——
+     * 表现就是封面全空、线程全空闲、也不产生网络请求。这条日志直接给出答案。
+     */
+    private static void logFrescoState(Application app) {
+        if (app == null) {
+            return;
+        }
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> fresco = cl.loadClass("com.facebook.drawee.backends.pipeline.Fresco");
+            Object inited = fresco.getMethod("hasBeenInitialized").invoke(null);
+            top.niunaijun.blackbox.utils.DiagLog.log("Fresco", "initialized=" + inited);
+            if (!Boolean.TRUE.equals(inited)) {
+                return;
+            }
+            Object pipe = fresco.getMethod("getImagePipeline").invoke(null);
+            if (pipe == null) {
+                return;
+            }
+            for (java.lang.reflect.Method m : pipe.getClass().getMethods()) {
+                if (m.getParameterCount() != 0) {
+                    continue;
+                }
+                if (m.getName().equals("isPaused")) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                            "isPaused=" + m.invoke(pipe));
+                } else if (m.getName().contains("CacheStats")) {
+                    Object st = m.invoke(pipe);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                            m.getName() + "=" + st);
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                    "failed " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
     }
 
     /**
@@ -1509,6 +1569,134 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Lib",
                     "failed " + t.getClass().getSimpleName());
+        }
+    }
+
+    /** 包在 NetworkClient 外面的埋点代理：每个请求一行日志。 */
+    private static final class HttpTraceHandler implements java.lang.reflect.InvocationHandler {
+        private final Object target;
+
+        HttpTraceHandler(Object target) {
+            this.target = target;
+        }
+
+        @Override
+        public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) throws Throwable {
+            String name = method.getName();
+            // 只记真正发请求的方法，避免 getClass/hashCode 之类刷屏
+            boolean looksHttp = args != null && args.length >= 1
+                    && args[0] instanceof String
+                    && ((String) args[0]).startsWith("http");
+            if (!looksHttp) {
+                try {
+                    return method.invoke(target, args);
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            }
+            String url = (String) args[0];
+            long t0 = System.currentTimeMillis();
+            try {
+                Object r = method.invoke(target, args);
+                top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                        "req " + name + " " + trim(url) + " -> "
+                                + (r == null ? "null"
+                                : (r instanceof String ? "len=" + ((String) r).length() : "obj"))
+                                + " " + (System.currentTimeMillis() - t0) + "ms");
+                return r;
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                Throwable c = e.getCause() == null ? e : e.getCause();
+                top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                        "req " + name + " " + trim(url) + " FAIL "
+                                + (System.currentTimeMillis() - t0) + "ms "
+                                + c.getClass().getName() + " " + c.getMessage());
+                throw c;
+            }
+        }
+
+        private static String trim(String url) {
+            int q = url.indexOf('?');
+            String s = q > 0 ? url.substring(0, q) : url;
+            return s.length() > 110 ? s.substring(0, 110) + "…" : s;
+        }
+    }
+
+    /**
+     * 打印**每个线程当前的内核系统调用**。
+     *
+     * 关键：Chromium/Cronet、TTNet、MDL 这些线程是纯 native 的，Java 栈是空的
+     * （`Thread.getStackTrace()` 返回 0 帧），从 Java 侧完全看不出它们在干什么。
+     * 但 `/proc/self/task/<tid>/syscall` 对同进程可读，能直接看到
+     * epoll_pwait（空闲）、futex（等锁）、connect（连不出去）、recvfrom（等响应）。
+     *
+     * 这决定了「请求没发出去」还是「发出去了在等响应」。
+     */
+    private static void logNativeThreads() {
+        final String[] names = {
+                "0 io_setup", "22 epoll_pwait", "21 epoll_ctl", "63 read", "64 write",
+                "56 openat", "57 close", "73 ppoll", "98 futex", "101 nanosleep",
+                "198 socket", "200 bind", "201 listen", "202 accept", "203 connect",
+                "206 sendto", "207 recvfrom", "208 sendmsg", "209 recvmsg", "210 shutdown",
+                "242 accept4", "172 getpid"};
+        java.util.Map<String, String> byNum = new java.util.HashMap<>();
+        for (String s : names) {
+            int sp = s.indexOf(' ');
+            byNum.put(s.substring(0, sp), s.substring(sp + 1));
+        }
+        try {
+            java.io.File dir = new java.io.File("/proc/self/task");
+            java.io.File[] tasks = dir.listFiles();
+            if (tasks == null) {
+                return;
+            }
+            for (java.io.File t : tasks) {
+                String tid = t.getName();
+                String comm = readShort(new java.io.File(t, "comm"));
+                String stat = readShort(new java.io.File(t, "stat"));
+                String syscall = readShort(new java.io.File(t, "syscall"));
+                String state = "?";
+                if (stat != null) {
+                    int rp = stat.lastIndexOf(')');
+                    if (rp > 0 && rp + 2 < stat.length()) {
+                        state = stat.substring(rp + 2, rp + 3);
+                    }
+                }
+                String sys = "?";
+                if (syscall != null && !syscall.startsWith("-")) {
+                    int sp = syscall.indexOf(' ');
+                    String num = sp > 0 ? syscall.substring(0, sp) : syscall;
+                    String nm = byNum.get(num);
+                    sys = nm == null ? ("sys#" + num) : nm;
+                    if ("epoll_pwait".equals(nm) || "ppoll".equals(nm)) {
+                        sys = sys + "(idle-poll)";
+                    }
+                } else if (syscall != null && syscall.startsWith("running")) {
+                    sys = "running";
+                }
+                top.niunaijun.blackbox.utils.DiagLog.log("NThread",
+                        tid + " " + state + " " + comm + " -> " + sys);
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("NThread",
+                    "failed " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static String readShort(java.io.File f) {
+        try {
+            byte[] buf = new byte[512];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            try {
+                int n = in.read(buf);
+                if (n <= 0) {
+                    return "";
+                }
+                return new String(buf, 0, n, "UTF-8").trim();
+            } finally {
+                in.close();
+            }
+        } catch (Throwable t) {
+            return null;
         }
     }
 
