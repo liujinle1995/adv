@@ -736,25 +736,40 @@ class AppState(
     suspend fun launch(id: String) {
         val instance = instances.firstOrNull { it.id == id } ?: return
 
-        // 单实例约束：同一时间只能运行一个实例，启动前先把其它仍在运行的实例强制停掉
-        val otherRunning = instances.filter {
-            it.id != id && (it.state == RuntimeState.RUNNING || it.state == RuntimeState.STARTING)
+        // 单实例约束 + 干净重启：启动前把「所有」运行中的实例停掉，包含目标实例自己。
+        //
+        // 目标实例自己也要停的原因：如果它已在运行，再走一次 launch 会创建第二个 :p0 进程，
+        // 两个进程抢同一个虚拟 uid/包，新进程会永久卡在 Application.onCreate。
+        // 真机实测（平板 Android 17）：pid=10107 已进主界面，launch 又建了 pid=11143，
+        // 后者 mainState=RUNNABLE 但停在 MuteApplicationStub.onCreate，
+        // 连续三轮 STACK DUMP 都没有进展，表现就是「重启应用卡住」。
+        val toStop = instances.filter {
+            it.state == RuntimeState.RUNNING || it.state == RuntimeState.STARTING
         }
-        if (otherRunning.isNotEmpty()) {
-            status = "正在停止其它运行中的实例…"
-            otherRunning.forEach { other ->
-                runCatching { engine.forceStop(other.id) }
+        if (toStop.isNotEmpty()) {
+            val others = toStop.count { it.id != id }
+            status = if (others > 0) "正在停止其它运行中的实例…" else "正在停止旧进程…"
+            toStop.forEach { old ->
+                runCatching { engine.forceStop(old.id) }
                 persist(
                     instances.map {
-                        if (it.id == other.id) {
+                        if (it.id == old.id) {
                             it.copy(state = RuntimeState.STOPPED, lastExitReason = ExitReason.USER_STOPPED)
                         } else it
                     }
                 )
             }
+            // 等引擎把旧进程真正回收：kill 是同步下发、退出是异步的，
+            // 紧接着 launch 会撞上正在退出的进程，又会卡在 onCreate。
+            val deadline = System.currentTimeMillis() + 2500
+            while (System.currentTimeMillis() < deadline) {
+                val st = (engine.queryState(id) as? EngineResult.Success)?.value?.state
+                if (st != RuntimeState.RUNNING && st != RuntimeState.STARTING) break
+                kotlinx.coroutines.delay(150)
+            }
             logger.info(
                 "AppState",
-                "单实例约束：启动前已强制停止 ${otherRunning.size} 个其它实例（${otherRunning.joinToString { it.packageName }}）"
+                "启动前清理：停止 ${toStop.size} 个实例（其它 $others 个，含目标自身 ${toStop.size - others} 个）"
             )
         }
 

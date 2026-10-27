@@ -21,6 +21,16 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 73,
+            versionName = "0.9.9",
+            title = "修重启卡死、启动页兜底提速、清数据后不再自己退出",
+            highlights = listOf(
+                "重启实例卡死：已在运行的实例再点启动会重复创建进程，两个进程抢同一个虚拟 uid，后者永久卡在 Application.onCreate。现在启动前会先停掉旧进程并等它真正退出",
+                "启动页不跳转时的兜底从 25 秒缩短到 10 秒，进主界面不用再干等",
+                "清空数据后隐私弹窗会被误关：启动页补救逻辑在有弹窗时不再插手，弹窗交回给用户点",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 72,
             versionName = "0.9.8",
             title = "实例强制停止 + 单实例运行约束",

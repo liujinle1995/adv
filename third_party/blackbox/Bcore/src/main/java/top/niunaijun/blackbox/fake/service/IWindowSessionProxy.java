@@ -29,6 +29,22 @@ public class IWindowSessionProxy extends BinderInvocationStub {
         mSession = session;
     }
 
+    /**
+     * 当前还在显示的 Dialog / Popup 窗口数量。
+     *
+     * 用途：判断「应用是不是正等用户操作弹窗」。
+     * 典型场景：红果首启隐私弹窗 —— 启动页补救逻辑若无脑反射调 x2()，
+     * 会在弹窗存在时把启动页 UI 抢着建出来，与弹窗状态互相覆盖，
+     * 最终弹窗被自己 dismiss（走「不同意」分支）而应用直接退出。
+     * 有弹窗时应当完全不干预，交给用户点。
+     */
+    public static final java.util.concurrent.atomic.AtomicInteger DIALOG_WINDOWS =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    public static boolean hasVisibleDialog() {
+        return DIALOG_WINDOWS.get() > 0;
+    }
+
     @Override
     protected Object getWho() {
         return mSession;
@@ -54,6 +70,7 @@ public class IWindowSessionProxy extends BinderInvocationStub {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
             String desc = "";
+            boolean isDialog = false;
             for (Object arg : args) {
                 if (arg == null) {
                     continue;
@@ -62,6 +79,9 @@ public class IWindowSessionProxy extends BinderInvocationStub {
                     WindowManager.LayoutParams lp = (WindowManager.LayoutParams) arg;
                     desc = "type=" + lp.type + " w=" + lp.width + " h=" + lp.height
                             + " token=" + (lp.token != null) + " title=" + lp.getTitle();
+                    // TYPE_APPLICATION(2) 及 2000–2999 的子窗口都是 Dialog/Popup 这一层；
+                    // Activity 自己的窗口是 TYPE_BASE_APPLICATION(1)。
+                    isDialog = lp.type == 2 || (lp.type >= 2000 && lp.type < 3000);
                     lp.packageName = BlackBoxCore.getHostPkg();
                 }
             }
@@ -71,6 +91,9 @@ public class IWindowSessionProxy extends BinderInvocationStub {
                 Object result = method.invoke(who, args);
                 top.niunaijun.blackbox.utils.DiagLog.log(
                         "WMS", "addToDisplay -> " + result + " | " + desc);
+                if (isDialog && Integer.valueOf(0).equals(result)) {
+                    DIALOG_WINDOWS.incrementAndGet();
+                }
                 return result;
             } catch (Throwable t) {
                 top.niunaijun.blackbox.utils.DiagLog.log(
@@ -119,6 +142,12 @@ public class IWindowSessionProxy extends BinderInvocationStub {
             } catch (Throwable ignored) {
             }
             Object result = method.invoke(who, args);
+            // remove 不携带窗口类型，只能按「有就减」处理；减到 0 为止。
+            // 误差只可能让计数提前归零（Activity 窗口先被移除时），
+            // 而那种时刻 Activity 本身正在销毁，已不需要「弹窗是否可见」的判断。
+            if (DIALOG_WINDOWS.get() > 0) {
+                DIALOG_WINDOWS.decrementAndGet();
+            }
             top.niunaijun.blackbox.utils.DiagLog.log("WMS", sb.toString());
             return result;
         }

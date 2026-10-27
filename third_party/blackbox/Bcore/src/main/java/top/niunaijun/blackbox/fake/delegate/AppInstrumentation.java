@@ -199,9 +199,11 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             // x2() 必然抛 `had you called RpcService.init`，等于白跑一次。
             new SplashRecovery(activity, handler, cls).start();
 
-            // 第 2 步（25s）：启动页还在（没有 finish，说明它不打算跳转）→
+            // 第 2 步（10s）：启动页还在（没有 finish，说明它不打算跳转）→
             // 直接启动应用的主界面 Activity。这类应用的主界面通常可以独立启动，
             // 启动页只是在等一个永远不会完成的初始化回调。
+            // 10s 的依据：红果正常启动页 1–3s 就 finish，10s 后还在就是真卡住了；
+            // 原先是 25s，用户要干等 25 秒才看到主界面（真机实测 16:46:26 才 fallback）。
             handler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
@@ -228,7 +230,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                         logRecoverThrowable("fallback main", t);
                     }
                 }
-            }, 25000L);
+            }, 10000L);
         } catch (Throwable ignored) {
         }
     }
@@ -265,6 +267,20 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 if (content > 0) {
                     top.niunaijun.blackbox.utils.DiagLog.log("Recover",
                             "splash rendered, content=" + content + " t=" + (ticks + 3) + "s");
+                    return;
+                }
+                // 有 Dialog 正在显示（典型：首启隐私弹窗）→ 应用在等用户点，绝不干预。
+                // 反例（真机实测）：清数据后弹窗已弹出，补救逻辑仍反射调 x2()，
+                // 把启动页 UI 抢着建出来，与弹窗互相覆盖，最后弹窗自己 dismiss
+                // 走的是「不同意」分支（栈 u0.T → AbsDialog.dismiss），应用直接退出。
+                if (top.niunaijun.blackbox.fake.service.IWindowSessionProxy.hasVisibleDialog()) {
+                    ticks++;
+                    if (ticks <= 25) {
+                        handler.postDelayed(this, 1000L);
+                    } else {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Recover",
+                                "x2 recovery gave up: dialog still visible t=" + ticks + "s");
+                    }
                     return;
                 }
                 boolean ready = isRpcReady(activity);
