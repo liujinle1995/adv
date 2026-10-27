@@ -86,6 +86,26 @@ public final class DiagLog {
         return null;
     }
 
+    /**
+     * 宿主的外部私有目录（`.../Android/data/<hostPkg>/files`）。
+     *
+     * 宿主主进程和虚拟应用进程跑在**同一个 uid**（沙箱进程由宿主 fork）,
+     * 所以两边都能读写这里。诊断触发器（`adb shell touch`）就放在这下面。
+     * 拿不到宿主包名时返回 null。
+     */
+    public static File externalFilesDir() {
+        String pkg = hostPkg();
+        if (pkg == null) {
+            return null;
+        }
+        try {
+            return new File(Environment.getExternalStorageDirectory(),
+                    "Android/data/" + pkg + "/files");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private static String hostPkg() {
         try {
             String pkg = BlackBoxCore.getHostPkg();

@@ -31,6 +31,18 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
 
     private static AppInstrumentation sAppInstrumentation;
 
+    /** 便于后续诊断直接取 TTExecutors 的静态线程池做状态快照。 */
+    private static volatile Class<?> sTTExecutors;
+    private static volatile boolean diagPollerStarted;
+    /**
+     * 目标应用自己的 Application（`MuteApplicationStub` 之类）。
+     *
+     * 注意：同一个进程里 callApplicationOnCreate 会被调用两次——先宿主 AdvApp，
+     * 再虚拟应用的 Application。诊断必须用后者（它的 ClassLoader 才是应用自己的
+     * NewMiraClassloader），否则连应用自己的类都查不到。
+     */
+    private static volatile Application sTargetApp;
+
     public static AppInstrumentation get() {
         if (sAppInstrumentation == null) {
             synchronized (AppInstrumentation.class) {
@@ -154,11 +166,19 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         try {
             final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
             final String name = activity.getClass().getSimpleName();
-            for (int i = 1; i <= 90; i++) {
-                final int seconds = i * 2;
-                handler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
+            // 只在「内容区还是空」时需要盯：一旦有子 View 再连续观察一次就收工，
+            // 否则每个 Activity 90 次 × 多个 Activity 会把日志刷成几 MB（实测一天 5.4 MB）。
+            handler.post(new Runnable() {
+                private int tick;
+                private int nonEmptyStreak;
+
+                @Override
+                public void run() {
+                    tick++;
+                    try {
+                        if (activity.isFinishing() || activity.isDestroyed()) {
+                            return;
+                        }
                         int contentChildren = -1;
                         try {
                             android.view.View content = activity.findViewById(android.R.id.content);
@@ -167,12 +187,25 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                             }
                         } catch (Throwable ignored) {
                         }
-                        top.niunaijun.blackbox.utils.DiagLog.log("Life",
-                                "watch " + name + " contentChildren=" + contentChildren
-                                        + " t=" + seconds + "s");
+                        boolean report = contentChildren <= 0 || nonEmptyStreak < 1;
+                        if (contentChildren > 0) {
+                            nonEmptyStreak++;
+                        }
+                        if (report) {
+                            top.niunaijun.blackbox.utils.DiagLog.log("Life",
+                                    "watch " + name + " contentChildren=" + contentChildren
+                                            + " t=" + (tick * 2) + "s");
+                        }
+                        if (nonEmptyStreak >= 2) {
+                            return;
+                        }
+                    } catch (Throwable ignored) {
                     }
-                }, seconds * 1000L);
-            }
+                    if (tick < 30) {
+                        handler.postDelayed(this, 2000L);
+                    }
+                }
+            });
         } catch (Throwable ignored) {
         }
     }
@@ -410,6 +443,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             }
             top.niunaijun.blackbox.utils.DiagLog.log("Exec",
                     "classloader=" + cl.getClass().getSimpleName() + " pkg=" + app.getPackageName());
+            sTTExecutors = c;
 
             // 1) 无参静态方法里找 resume/start/wake 之类，逐个尝试
             for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
@@ -449,6 +483,10 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             replacePool(c, "sIOThreadPool", "adv-io");
             replacePool(c, "sBackgroundThreadPool", "adv-bg");
             replacePool(c, "sCPUThreadPool", "adv-cpu");
+            // sSerialThreadPool 是字节自带的串行执行器（类型不是标准 ThreadPoolExecutor），
+            // 图片/播放器那条链路经常把"最后一步"派到串行队列里；它不跑任务时表现为
+            // socket 已建立、请求却永远发不出去。换成标准单线程串行执行器，语义一致。
+            replaceSerialPool(c, "sSerialThreadPool", "adv-serial");
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Exec",
                     "wake skipped: " + t.getClass().getSimpleName() + " " + t.getMessage());
@@ -488,6 +526,41 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Exec",
                     "replace " + fieldName + " failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /**
+     * 把字节自带的串行执行器换成标准单线程执行器（FIFO，语义等价）。
+     *
+     * 与 {@link #replacePool} 分开是因为这类字段的类型不是 ThreadPoolExecutor，
+     * 直接用他家的实现时"任务进得去、不出来"，且从外部完全看不到队列长度。
+     */
+    private static void replaceSerialPool(Class<?> ttExecutors, String fieldName, String threadName) {
+        try {
+            java.lang.reflect.Field f = ttExecutors.getDeclaredField(fieldName);
+            f.setAccessible(true);
+            Object old = f.get(null);
+            if (old == null) {
+                return;
+            }
+            java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newSingleThreadExecutor(
+                            new java.util.concurrent.ThreadFactory() {
+                                @Override
+                                public Thread newThread(Runnable r) {
+                                    Thread t = new Thread(r, threadName);
+                                    t.setDaemon(false);
+                                    return t;
+                                }
+                            });
+            f.set(null, pool);
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "replaced " + fieldName + ": " + old.getClass().getSimpleName()
+                            + " -> single-serial");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "replace " + fieldName + " failed: " + t.getClass().getSimpleName()
+                            + " " + t.getMessage());
         }
     }
 
@@ -799,6 +872,15 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         dumpMainStackIfStuck(app);
         checkHCallback();
         startUnstick(mainThread());
+        if (app != null) {
+            // 同一个进程会先拿到宿主 AdvApp、再拿到目标应用的 Application；
+            // 诊断一律用后者（ClassLoader 才对）。
+            String cn = app.getClass().getName();
+            if (!"com.adv.runner.AdvApp".equals(cn)) {
+                sTargetApp = app;
+            }
+            startDiagPoller(app);
+        }
         try {
             super.callApplicationOnCreate(app);
         } catch (Throwable t) {
@@ -1293,7 +1375,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 if (t == null || t == Thread.currentThread()) {
                     continue;
                 }
-                if (dumped++ >= 80) {
+                if (dumped++ >= 400) {
                     break;
                 }
                 sb.append("\n  [").append(t.getName()).append("] ").append(t.getState())
@@ -1309,6 +1391,561 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             }
             top.niunaijun.blackbox.utils.DiagLog.log("Inst", sb.toString());
         } catch (Throwable ignored) {
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 按需诊断（线上取证）
+    //
+    // 现象：平板 Android 17 上首页能出内容，但「加载更多」永远转圈、封面不加载、
+    // 视频点不开。此时进程里所有线程池都是空闲的、没有任何新 socket，
+    // 说明应用**根本没有发起请求**，而不是请求发出去失败了。
+    //
+    // 这种"安静卡住"从外部完全看不见（ROM 把 logcat 加密了），所以提供一个
+    // 外部触发点：`adb shell touch /sdcard/Android/data/<宿主包>/files/.diag/dump`
+    // 引擎会立刻把「线程池真实状态 + 全网线程栈 + 网络连通性」写进诊断日志。
+    // ------------------------------------------------------------------
+
+    /** 起一个轮询线程，等外部触发文件出现。 */
+    private static void startDiagPoller(final Application app) {
+        if (diagPollerStarted) {
+            return;
+        }
+        diagPollerStarted = true;
+        final Application hostApp = app;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                java.io.File trigger = null;
+                long lastMtime = 0L;
+                for (int i = 0; i < 7200; i++) {
+                    try {
+                        if (trigger == null) {
+                            java.io.File base = top.niunaijun.blackbox.utils.DiagLog.externalFilesDir();
+                            if (base != null) {
+                                trigger = new java.io.File(new java.io.File(base, ".diag"), "dump");
+                            }
+                        }
+                        // 按 mtime 触发（不删文件）：宿主主进程/:push/虚拟应用进程
+                        // 各自轮询，删文件会让只有一个进程拿到这次触发。
+                        if (trigger != null && trigger.exists()) {
+                            long mtime = trigger.lastModified();
+                            if (mtime != 0L && mtime != lastMtime) {
+                                lastMtime = mtime;
+                                Application target = sTargetApp != null ? sTargetApp : hostApp;
+                                dumpDiagnostics(target, "trigger");
+                            }
+                        }
+                        Thread.sleep(700L);
+                    } catch (InterruptedException e) {
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }, "adv-diag-poll");
+        t.setDaemon(true);
+        t.start();
+        top.niunaijun.blackbox.utils.DiagLog.log("Diag", "poller started");
+    }
+
+    /** 一次性把关键运行时状态打进日志。 */
+    private static void dumpDiagnostics(Application app, String reason) {
+        top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump begin (" + reason + ") ===");
+        logExecutorState(app);
+        logNetworkState(app);
+        probeAppHttp(app);
+        logMappedLibs();
+        logAllThreads(app);
+        exportAppSelfLogs(app);
+        top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump end ===");
+    }
+
+    /**
+     * 看关键 native 库到底有没有被映射进进程。
+     *
+     * 图片解码（webp/heif）和视频播放（ttmplayer/ffmpeg）都靠 .so；如果这些库
+     * 在沙箱里没加载成功，表现就是「图片全是占位、视频一直转圈」，而纯 Java
+     * 的接口请求完全正常。UnsatisfiedLinkError 通常被应用吞掉，不会显式报错。
+     */
+    private static void logMappedLibs() {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(
+                    "/proc/self/maps"));
+            StringBuilder sb = new StringBuilder();
+            try {
+                String line;
+                int total = 0;
+                java.util.Set<String> libs = new java.util.LinkedHashSet<>();
+                while ((line = r.readLine()) != null) {
+                    total++;
+                    int i = line.indexOf(".so");
+                    if (i < 0) {
+                        continue;
+                    }
+                    int slash = line.lastIndexOf('/', i);
+                    if (slash >= 0) {
+                        libs.add(line.substring(slash + 1, i + 3));
+                    }
+                }
+                sb.append("maps lines=").append(total).append(" libs=").append(libs.size());
+                top.niunaijun.blackbox.utils.DiagLog.log("Lib", sb.toString());
+                String[] keys = {"webp", "heif", "heic", "jpeg", "imagepipeline", "ttmplayer",
+                        "avcodec", "ffmpeg", "ttboringssl", "ttcrypto", "cronet", "ttnet",
+                        "mdl", "bda", "ttm", "bytebench"};
+                for (String k : keys) {
+                    StringBuilder hit = new StringBuilder();
+                    for (String lib : libs) {
+                        if (lib.toLowerCase().contains(k)) {
+                            hit.append(lib).append(' ');
+                        }
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("Lib",
+                            k + ": " + (hit.length() == 0 ? "-" : hit.toString().trim()));
+                }
+            } finally {
+                r.close();
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Lib",
+                    "failed " + t.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * 用应用自己的 HTTP 客户端（字节 NetworkClient，底层是 TTNet）去取一个 URL。
+     *
+     * 为什么要这么做：实测接口 JSON 走 OkHttp 正常，而图片/视频（走 TTNet）完全
+     * 不动。这里直接拿 TTNet 打一发，把结果或异常原样打出来，就能区分
+     * 「TTNet 这条链路坏了」和「上层根本没调用」。
+     */
+    private static void probeAppHttp(final Application app) {
+        if (app == null) {
+            return;
+        }
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String url = "https://www.baidu.com/";
+                // 1) 应用自己的 NetworkClient（TTNet）
+                ttnet_probe:
+                try {
+                    ClassLoader cl = app.getClassLoader();
+                    Class<?> nc = null;
+                    String lastErr = "";
+                    ClassLoader[] loaders = {cl,
+                            Thread.currentThread().getContextClassLoader(),
+                            AppInstrumentation.class.getClassLoader()};
+                    for (ClassLoader l : loaders) {
+                        if (l == null) {
+                            continue;
+                        }
+                        try {
+                            // 必须用 loadClass(String)：红果的 NewMiraClassloader 重写了
+                            // loadClass(String, boolean)，Class.forName(…, false, cl) 会走
+                            // 到那条分支里查不到类（引擎自己一直用 loadClass 才正常）。
+                            nc = l.loadClass("com.bytedance.common.utility.NetworkClient");
+                            top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                                    "NetworkClient loaded by " + l.getClass().getName()
+                                            + " appCl=" + (cl == null ? "null"
+                                            : cl.getClass().getName()));
+                            break;
+                        } catch (Throwable e) {
+                            lastErr = e.getClass().getSimpleName() + ": " + e.getMessage();
+                        }
+                    }
+                    if (nc == null) {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                                "NetworkClient CNFE " + lastErr);
+                        break ttnet_probe;
+                    }
+                    Object client = null;
+                    for (java.lang.reflect.Method m : nc.getMethods()) {
+                        if (m.getParameterCount() == 0
+                                && nc.isAssignableFrom(m.getReturnType())
+                                && java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
+                            client = m.invoke(null);
+                            break;
+                        }
+                    }
+                    if (client == null) {
+                        for (java.lang.reflect.Field f : nc.getDeclaredFields()) {
+                            if (nc.isAssignableFrom(f.getType())) {
+                                f.setAccessible(true);
+                                client = f.get(null);
+                                if (client != null) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                            "NetworkClient instance=" + (client == null ? "null"
+                                    : client.getClass().getName()));
+                    if (client != null) {
+                        java.lang.reflect.Method target = null;
+                        StringBuilder sigs = new StringBuilder();
+                        for (java.lang.reflect.Method m : client.getClass().getMethods()) {
+                            if (m.getParameterCount() == 1
+                                    && m.getParameterTypes()[0] == String.class) {
+                                sigs.append(m.getName()).append("->")
+                                        .append(m.getReturnType().getSimpleName()).append(' ');
+                                if (target == null && m.getReturnType() == String.class) {
+                                    target = m;
+                                }
+                            }
+                        }
+                        top.niunaijun.blackbox.utils.DiagLog.log("Probe", "methods: " + sigs);
+                        if (target != null) {
+                            long t0 = System.currentTimeMillis();
+                            try {
+                                Object r = target.invoke(client, url);
+                                String head = "";
+                                if (r instanceof String) {
+                                    String s = (String) r;
+                                    head = " head=" + s.substring(0, Math.min(60, s.length()))
+                                            .replace('\n', ' ');
+                                }
+                                top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                                        "ttnet " + target.getName() + "(" + url + ") -> "
+                                                + (r == null ? "null"
+                                                : (r instanceof String
+                                                ? "len=" + ((String) r).length() : String.valueOf(r)))
+                                                + head
+                                                + " in " + (System.currentTimeMillis() - t0) + "ms");
+                            } catch (Throwable e) {
+                                Throwable c = (e instanceof java.lang.reflect.InvocationTargetException
+                                        && e.getCause() != null) ? e.getCause() : e;
+                                top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                                        "ttnet " + target.getName() + " FAIL in "
+                                                + (System.currentTimeMillis() - t0) + "ms "
+                                                + c.getClass().getName() + " " + c.getMessage());
+                            }
+                        }
+                    }
+                } catch (Throwable e) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                            "ttnet probe err " + e.getClass().getSimpleName());
+                }
+                // 2) 对照：Java 侧 HttpURLConnection
+                long t1 = System.currentTimeMillis();
+                try {
+                    java.net.HttpURLConnection c =
+                            (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    c.setConnectTimeout(5000);
+                    c.setReadTimeout(5000);
+                    int code = c.getResponseCode();
+                    top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                            "hurl code=" + code + " in " + (System.currentTimeMillis() - t1) + "ms");
+                    c.disconnect();
+                } catch (Throwable e) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Probe",
+                            "hurl FAIL in " + (System.currentTimeMillis() - t1) + "ms "
+                                    + e.getClass().getSimpleName() + " " + e.getMessage());
+                }
+            }
+        }, "adv-http-probe");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * 把虚拟应用自己写的日志（字节的 alog / TTNet / 播放器 mdl）搬到外部可读目录。
+     *
+     * 这是排查「图片不加载、视频不播放」最直接的证据来源：这类失败只在应用
+     * 自己的日志里有错误码（TTNet error / Fresco onFailure），而进程数据目录
+     * adb 读不到、ROM 又把 logcat 加密了。
+     *
+     * 只搬文本类小文件（单文件 < 3 MB），总量上限 20 MB，避免把整个 data 拖出来。
+     */
+    private static void exportAppSelfLogs(Application app) {
+        if (app == null) {
+            return;
+        }
+        try {
+            java.io.File base = top.niunaijun.blackbox.utils.DiagLog.externalFilesDir();
+            if (base == null) {
+                return;
+            }
+            java.io.File outDir = new java.io.File(new java.io.File(base, ".diag"),
+                    "app-" + android.os.Process.myPid());
+            java.io.File src = app.getFilesDir();
+            if (src == null || !src.isDirectory()) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Export", "no files dir");
+                return;
+            }
+            // 先打一份目录树（应用自己的日志不一定在 files/ 下，字节系常在
+            // data 根目录的 app_alog / alog 里），再按文件类型复制。
+            java.io.File dataDir = null;
+            try {
+                dataDir = app.getDataDir();
+            } catch (Throwable ignored) {
+            }
+            if (dataDir != null) {
+                listTree(dataDir, 0);
+            }
+            long[] budget = {20L * 1024 * 1024};
+            int[] count = {0};
+            copyTree(src, outDir, budget, count, 0);
+            if (dataDir != null) {
+                // 虚拟应用真正的数据目录：context 的 getDataDir() 拿到的是宿主路径，
+                // 目标应用的私有目录在 blackbox/data/user/<userId>/<pkg> 下。
+                java.io.File vroot = new java.io.File(dataDir, "blackbox/data/user");
+                java.io.File[] users = vroot.listFiles();
+                if (users != null) {
+                    for (java.io.File u : users) {
+                        java.io.File[] pkgs = u.listFiles();
+                        if (pkgs == null) {
+                            continue;
+                        }
+                        for (java.io.File p : pkgs) {
+                            listTree(p, 0);
+                            copyTree(p, new java.io.File(outDir,
+                                    "_v/" + u.getName() + "/" + p.getName()), budget, count, 0);
+                        }
+                    }
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Export",
+                    "copied " + count[0] + " files to " + outDir
+                            + " left=" + (budget[0] / 1024) + "KB");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Export",
+                    "failed " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    private static final String[] EXPORT_SKIP_DIRS = {
+            "cache", "code_cache", "lib", "oat", ".tmp", ".adv_flags"};
+
+    /** 打目录树：只看 3 层，输出「目录 → 文件数/总字节」，用来定位应用日志到底写在哪。 */
+    private static void listTree(java.io.File dir, int depth) {
+        if (depth > 2) {
+            return;
+        }
+        java.io.File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        int files = 0;
+        long bytes = 0L;
+        for (java.io.File f : children) {
+            if (f.isFile()) {
+                files++;
+                bytes += f.length();
+            }
+        }
+        top.niunaijun.blackbox.utils.DiagLog.log("Tree",
+                dir.getAbsolutePath() + " files=" + files + " bytes=" + bytes);
+        for (java.io.File f : children) {
+            if (f.isDirectory()) {
+                listTree(f, depth + 1);
+            }
+        }
+    }
+
+    private static void copyTree(java.io.File src, java.io.File dst,
+                                 long[] budget, int[] count, int depth) {
+        if (depth > 6 || budget[0] <= 0) {
+            return;
+        }
+        String name = src.getName();
+        for (String skip : EXPORT_SKIP_DIRS) {
+            if (skip.equals(name)) {
+                return;
+            }
+        }
+        java.io.File[] children = src.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (java.io.File f : children) {
+            if (budget[0] <= 0) {
+                return;
+            }
+            if (f.isDirectory()) {
+                copyTree(f, new java.io.File(dst, f.getName()), budget, count, depth + 1);
+                continue;
+            }
+            long len = f.length();
+            if (len <= 0 || len > 3L * 1024 * 1024) {
+                continue;
+            }
+            String ln = f.getName().toLowerCase();
+            // 字节的 alog 经常没有扩展名，所以用"排除二进制"而不是"只收 .log"
+            boolean binary = ln.endsWith(".so") || ln.endsWith(".db") || ln.endsWith(".dex")
+                    || ln.endsWith(".apk") || ln.endsWith(".png") || ln.endsWith(".jpg")
+                    || ln.endsWith(".jpeg") || ln.endsWith(".webp") || ln.endsWith(".ttf")
+                    || ln.endsWith(".oat") || ln.endsWith(".vdex") || ln.endsWith(".zip");
+            if (binary) {
+                continue;
+            }
+            try {
+                //noinspection ResultOfMethodCallIgnored
+                dst.mkdirs();
+                java.io.File out = new java.io.File(dst, f.getName());
+                java.io.InputStream in = new java.io.FileInputStream(f);
+                try {
+                    java.io.OutputStream os = new java.io.FileOutputStream(out);
+                    try {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            os.write(buf, 0, n);
+                            budget[0] -= n;
+                        }
+                    } finally {
+                        os.close();
+                    }
+                } finally {
+                    in.close();
+                }
+                count[0]++;
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * 打印 TTExecutors 各线程池的真实状态。
+     *
+     * 判据：`queue` 一直涨而 `completed` 不涨 = 任务进得去、没人跑；
+     * `queue` 为 0 且 `completed` 为 0 = 应用压根没提交任务（问题在更上层）。
+     */
+    private static void logExecutorState(Application app) {
+        try {
+            Class<?> c = sTTExecutors;
+            if (c == null && app != null) {
+                c = Class.forName("com.bytedance.common.utility.concurrent.TTExecutors",
+                        false, app.getClassLoader());
+                sTTExecutors = c;
+            }
+            if (c == null) {
+                return;
+            }
+            String[] fields = {"sNormalThreadPool", "sIOThreadPool", "sBackgroundThreadPool",
+                    "sCPUThreadPool", "sSerialThreadPool", "sScheduledThreadPool"};
+            for (String name : fields) {
+                try {
+                    java.lang.reflect.Field f = c.getDeclaredField(name);
+                    f.setAccessible(true);
+                    Object v = f.get(null);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Pool", name + " " + describePool(v));
+                } catch (Throwable t) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Pool",
+                            name + " err " + t.getClass().getSimpleName());
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Pool", "failed " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static String describePool(Object v) {
+        if (v == null) {
+            return "null";
+        }
+        if (v instanceof java.util.concurrent.ThreadPoolExecutor) {
+            java.util.concurrent.ThreadPoolExecutor p = (java.util.concurrent.ThreadPoolExecutor) v;
+            try {
+                return p.getClass().getSimpleName()
+                        + " size=" + p.getPoolSize()
+                        + " active=" + p.getActiveCount()
+                        + " queue=" + p.getQueue().size()
+                        + " completed=" + p.getCompletedTaskCount();
+            } catch (Throwable ignored) {
+            }
+        }
+        return v.getClass().getSimpleName() + " (not TPE)";
+    }
+
+    /**
+     * 网络状态 + 真实连通性探针。
+     *
+     * 应用侧如果认为"没有网络"，会停在加载态而不发请求——这是"安静卡住"的
+     * 另一种解释。这里同时看系统给的能力位和真实 TCP 能不能连出去。
+     */
+    private static void logNetworkState(final Application app) {
+        try {
+            final android.content.Context ctx = app == null
+                    ? top.niunaijun.blackbox.BlackBoxCore.getContext() : app;
+            if (ctx == null) {
+                return;
+            }
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                android.net.Network n = cm.getActiveNetwork();
+                android.net.NetworkCapabilities nc =
+                        n == null ? null : cm.getNetworkCapabilities(n);
+                top.niunaijun.blackbox.utils.DiagLog.log("Net",
+                        "active=" + n + " caps=" + (nc == null ? "null" : nc.toString()));
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Net", "state failed: "
+                    + t.getClass().getSimpleName());
+        }
+        Thread probe = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String host = "www.baidu.com";
+                int port = 443;
+                long t0 = System.currentTimeMillis();
+                java.net.Socket s = new java.net.Socket();
+                try {
+                    s.connect(new java.net.InetSocketAddress(host, port), 4000);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Net",
+                            "tcp " + host + ":" + port + " OK in "
+                                    + (System.currentTimeMillis() - t0) + "ms");
+                } catch (Throwable e) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Net",
+                            "tcp " + host + ":" + port + " FAIL in "
+                                    + (System.currentTimeMillis() - t0) + "ms "
+                                    + e.getClass().getSimpleName() + " " + e.getMessage());
+                } finally {
+                    try {
+                        s.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }, "adv-net-probe");
+        probe.setDaemon(true);
+        probe.start();
+    }
+
+    /** 每个线程单独一条日志，方便 grep；关键线程给更多栈帧。 */
+    private static void logAllThreads(Application app) {
+        try {
+            java.util.Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+            top.niunaijun.blackbox.utils.DiagLog.log("Dump", "threads=" + all.size());
+            Thread main = android.os.Looper.getMainLooper().getThread();
+            for (java.util.Map.Entry<Thread, StackTraceElement[]> e : all.entrySet()) {
+                Thread t = e.getKey();
+                if (t == null) {
+                    continue;
+                }
+                StackTraceElement[] st = e.getValue();
+                String nm = t.getName();
+                boolean focus = nm != null && (nm.contains("TTNet") || nm.contains("Fresco")
+                        || nm.contains("adv-") || nm.contains("Chromium") || nm.contains("Cronet")
+                        || nm.contains("player") || nm.contains("mdl") || nm.contains("MediaLoad")
+                        || nm.contains("Serial") || nm.contains("okhttp") || nm.contains("OkHttp"));
+                int limit = Math.min(st.length, focus ? 40 : 8);
+                StringBuilder sb = new StringBuilder(256);
+                sb.append('[').append(nm).append("] ").append(t.getState())
+                        .append(t == main ? " *MAIN*" : "");
+                for (int i = 0; i < limit; i++) {
+                    sb.append("\n    at ").append(st[i]);
+                }
+                if (st.length > limit) {
+                    sb.append("\n    ... ").append(st.length - limit).append(" more");
+                }
+                top.niunaijun.blackbox.utils.DiagLog.log("Dump", sb.toString());
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Dump",
+                    "failed " + t.getClass().getSimpleName());
         }
     }
 

@@ -21,6 +21,18 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 78,
+            versionName = "0.9.14",
+            title = "诊断升级：可导出虚拟应用自身日志",
+            highlights = listOf(
+                "定位「图片封面全空、视频一直转圈，但接口数据正常」：沙箱里接口 JSON、TTNet 取网页都正常（实测 205ms 拿到完整 HTML），图片和播放器却不动",
+                "触发诊断时会顺带导出虚拟应用自己的日志、目录树，以及进程里已加载的 native 库清单（图片解码/播放器都靠 .so）",
+                "修复诊断触发只在宿主进程生效的问题：同一个进程会先拿到宿主 Application，必须用目标应用自己的 ClassLoader 才查得到它自己的类",
+                "把字节自带的串行执行器也换成标准单线程执行器（图片/播放链路的最后一步常排在这里）",
+                "修掉每 2 秒一次、持续 180 秒的内容观测日志：一天能写 5 MB，现在内容区一正常就收工",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 74,
             versionName = "0.9.10",
             title = "清空数据保留设备身份，避免清完就永久断网",
