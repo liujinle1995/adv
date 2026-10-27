@@ -872,6 +872,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         if (app != null) {
             probeSafeMode(app);
             clearSafeModeIfRequested(app);
+            // 越早越好：所有 bytex 代理线程池的构造函数都会读这个开关，
+            // 一旦某个池先被建出来，之后再改就救不回来了。
+            fixBytexThreadPool(app);
             wakeExecutors(app);
             // 必须在应用自己的 onCreate 之前配好 Keva 的执行器：
             // KevaImpl.<clinit> 首次执行时若 KevaBuilder.mExecutor 非空会直接采用，
@@ -2320,8 +2323,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 try {
                     Object sch = schedulers.getMethod(name).invoke(null);
                     String r = runOnScheduler(sch, 3000L);
+                    String d = runOnSchedulerDelayed(sch, 300L, 3000L);
                     top.niunaijun.blackbox.utils.DiagLog.log("Rx",
-                            name + " [" + sch.getClass().getName() + "] " + r);
+                            name + " [" + sch.getClass().getName() + "] " + r + " delay300=" + d);
                 } catch (Throwable t) {
                     top.niunaijun.blackbox.utils.DiagLog.log("Rx",
                             name + " failed: " + t.getClass().getSimpleName()
@@ -2515,6 +2519,69 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      * `getRequestManager().e(req).subscribeOn(Schedulers.io())` 永远不执行，
      * 于是预取缓存永远是空的，播放页拿不到数据只能空转。
      */
+    /** true=只清 RxJavaPlugins 的 scheduleHandler，保留原生调度器（语义最完整）。 */
+    private static final boolean RX_STOCK_MODE = false;
+
+    private static java.util.concurrent.ThreadFactory newAdvThreadFactory(final String name) {
+        return new java.util.concurrent.ThreadFactory() {
+            private final java.util.concurrent.atomic.AtomicInteger seq =
+                    new java.util.concurrent.atomic.AtomicInteger(1);
+
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, name + "-" + seq.getAndIncrement());
+                t.setDaemon(true);
+                return t;
+            }
+        };
+    }
+
+    /**
+     * 关掉 bytex 的「所有核心线程都允许超时」。
+     *
+     * `PThreadScheduledThreadPoolExecutor` 的构造函数里有：
+     *   if (SuperThreadPool.allowAllCoreThreadTimeOut) {
+     *       setKeepAliveTime(...);          // 但 setKeepAliveTime 被重写成
+     *                                      // “仅 enableBlockFetchTask 为 true 才生效”
+     *       allowCoreThreadTimeOut(true);
+     *   }
+     * 结果是「允许回收核心线程 + 保活时间还是默认 10ms」的组合。
+     * 实测这种池在沙箱里投任务后 poolSize=0、queued=0、completed=0 —— 线程根本没起来。
+     * 把开关关掉，池就退回标准 ScheduledThreadPoolExecutor 行为。
+     */
+    private static void fixBytexThreadPool(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> stp = cl.loadClass(
+                    "com.ss.android.ugc.bytex.pthread.base.convergence.SuperThreadPool");
+            java.lang.reflect.Field inst = stp.getField("INSTANCE");
+            Object obj = inst.get(null);
+            if (obj == null) {
+                return;
+            }
+            java.lang.reflect.Method setAllow = stp.getMethod(
+                    "setAllowAllCoreThreadTimeOut", boolean.class);
+            setAllow.invoke(obj, false);
+            // 更关键：ThreadFactoryProxy.newThread 会把线程包成 ThreadProxy
+            // （new ThreadProxy(thread, false, 2, null)），包完之后任务就不再执行了。
+            // 是否包装由 SuperThreadPool.mEnable 位掩码控制（代理类型传的是 8）。
+            // 把位掩码清 0，代理直接返回原始线程，bytex 的线程收敛等于关闭。
+            java.lang.reflect.Method setEnableType = stp.getMethod("setEnableType", int.class);
+            setEnableType.invoke(obj, 0);
+            java.lang.reflect.Method isEnable = stp.getMethod("isEnable", int.class);
+            Object enable8 = isEnable.invoke(obj, 8);
+            Object enable1 = isEnable.invoke(obj, 1);
+            Object v = stp.getMethod("getAllowAllCoreThreadTimeOut").invoke(obj);
+            top.niunaijun.blackbox.utils.DiagLog.log("Pool",
+                    "SuperThreadPool allowCoreTimeOut=" + v
+                            + " isEnable(8)=" + enable8 + " isEnable(1)=" + enable1);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Pool",
+                    "fixBytexThreadPool failed: " + t.getClass().getSimpleName()
+                            + " " + t.getMessage());
+        }
+    }
+
     private static void fixRxSchedulers(Application app) {
         try {
             ClassLoader cl = app.getClassLoader();
@@ -2524,18 +2591,56 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             Class<?> executorCls = java.util.concurrent.Executor.class;
             java.lang.reflect.Method from = schedulersCls.getMethod("from", executorCls);
 
+            // 0) 先修 bytex 线程池配置，否则后面新建的池一样是坏的
+            fixBytexThreadPool(app);
+            // 1) 清掉会吞任务的 scheduleHandler
+            String cleared = "no";
+            try {
+                pluginsCls.getMethod("setScheduleHandler", functionCls).invoke(null, (Object) null);
+                cleared = "ok";
+            } catch (Throwable t) {
+                cleared = t.getClass().getSimpleName();
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx", "scheduleHandler cleared=" + cleared);
+            if (RX_STOCK_MODE) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Rx", "stock mode: keep native schedulers");
+                return;
+            }
+
             if (!sRxPoolsReady) {
                 sRxIoPool = newAdvExecutor("adv-rx-io");
                 sRxComputePool = newAdvExecutor("adv-rx-cmp");
                 sRxSinglePool = newAdvExecutor("adv-rx-single");
                 sRxPoolsReady = true;
             }
-            final Object[] target = new Object[]{
-                    from.invoke(null, sRxIoPool),
-                    from.invoke(null, sRxComputePool),
-                    from.invoke(null, sRxSinglePool),
-                    from.invoke(null, sRxIoPool),
-            };
+            // 优先用「全新 new 出来的原生调度器」：语义完整，delay/timer/interval 都能用。
+            // ExecutorScheduler 只是兜底 —— 它不支持延时任务，会顺手废掉 delay/timeout。
+            // 注意：RxJava 内部类在 APK 里被混淆了（IoScheduler=e、ComputationScheduler=a、
+            // NewThreadScheduler=f），所以按候选名逐个试。
+            Object io = newStockScheduler(cl, new String[]{
+                    "io.reactivex.internal.schedulers.IoScheduler",
+                    "io.reactivex.internal.schedulers.e"}, "adv-rx-io");
+            Object cmp = newStockScheduler(cl, new String[]{
+                    "io.reactivex.internal.schedulers.ComputationScheduler",
+                    "io.reactivex.internal.schedulers.a"}, "adv-rx-cmp");
+            Object single = newStockScheduler(cl, new String[]{
+                    "io.reactivex.internal.schedulers.SingleScheduler"}, "adv-rx-single");
+            Object nt = newStockScheduler(cl, new String[]{
+                    "io.reactivex.internal.schedulers.NewThreadScheduler",
+                    "io.reactivex.internal.schedulers.f"}, "adv-rx-nt");
+            if (io == null) {
+                io = from.invoke(null, sRxIoPool);
+            }
+            if (cmp == null) {
+                cmp = from.invoke(null, sRxComputePool);
+            }
+            if (single == null) {
+                single = from.invoke(null, sRxSinglePool);
+            }
+            if (nt == null) {
+                nt = from.invoke(null, sRxIoPool);
+            }
+            final Object[] target = new Object[]{io, cmp, single, nt};
             String[] setters = {
                     "setIoSchedulerHandler",
                     "setComputationSchedulerHandler",
@@ -2568,11 +2673,68 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 pluginsCls.getMethod(setters[i], functionCls).invoke(null, handler);
                 ok++;
             }
-            top.niunaijun.blackbox.utils.DiagLog.log("Rx", "scheduler handlers installed=" + ok);
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                    "scheduler handlers installed=" + ok
+                            + " [" + io.getClass().getSimpleName()
+                            + ", " + cmp.getClass().getSimpleName()
+                            + ", " + single.getClass().getSimpleName()
+                            + ", " + nt.getClass().getSimpleName() + "]");
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Rx",
                     "fix failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
         }
+    }
+
+    /** new 一个原生 RxJava 调度器实例；失败返回 null，由调用方兜底。 */
+    private static Object newStockScheduler(ClassLoader cl, String[] classNames, String name) {
+        for (String className : classNames) {
+            try {
+                Class<?> c = cl.loadClass(className);
+                java.lang.reflect.Constructor<?>[] ctors = c.getDeclaredConstructors();
+                java.lang.reflect.Constructor<?> best = null;
+                for (java.lang.reflect.Constructor<?> k : ctors) {
+                    if (k.getParameterCount() == 0) {
+                        best = k;
+                        break;
+                    }
+                }
+                if (best == null) {
+                    // 优先挑「参数都能被我们填上」的：int 用核数，ThreadFactory 用自建工厂
+                    for (java.lang.reflect.Constructor<?> k : ctors) {
+                        boolean ok = true;
+                        for (Class<?> pt : k.getParameterTypes()) {
+                            if (pt != int.class && pt != java.util.concurrent.ThreadFactory.class) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (ok) {
+                            best = k;
+                            break;
+                        }
+                    }
+                }
+                if (best == null) {
+                    continue;
+                }
+                best.setAccessible(true);
+                Object[] args = new Object[best.getParameterCount()];
+                int cores = Math.max(2, Runtime.getRuntime().availableProcessors());
+                for (int i = 0; i < args.length; i++) {
+                    Class<?> pt = best.getParameterTypes()[i];
+                    if (pt == int.class) {
+                        args[i] = Integer.valueOf(cores);
+                    } else if (pt == java.util.concurrent.ThreadFactory.class) {
+                        args[i] = newAdvThreadFactory(name);
+                    } else {
+                        args[i] = null;
+                    }
+                }
+                return best.newInstance(args);
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 
     /**
@@ -2716,6 +2878,182 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                     "addView=" + info[0] + " surfaceCreated=" + ok + " surfaceChanged=" + c2);
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Surf",
+                    "probe failed " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    /**
+     * 直接 new 一个「原生」RxJava 调度器实例来测。
+     *
+     * 关键背景：`Schedulers.from(Executor)` 得到的是 ExecutorScheduler，
+     * 它**不支持延时/周期任务**（schedule(run, delay, unit) 直接返回空 Disposable）。
+     * 用它顶替 io 会顺手废掉所有 delay/timer/debounce/timeout，风险很大。
+     * 所以要先确认：全新 new 出来的原生 IoScheduler 是不是能正常工作。
+     * 如果能，就把修复换成「注入全新原生调度器」，语义完整。
+     */
+    private static void probeFreshSchedulers(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            String[][] defs = {
+                    {"io", "io.reactivex.internal.schedulers.e"},
+                    {"io2", "io.reactivex.internal.schedulers.IoScheduler"},
+                    {"newThread", "io.reactivex.internal.schedulers.f"},
+                    {"computation", "io.reactivex.internal.schedulers.a"},
+                    {"single", "io.reactivex.internal.schedulers.SingleScheduler"},
+            };
+            for (String[] d : defs) {
+                try {
+                    Class<?> c = cl.loadClass(d[1]);
+                    java.lang.reflect.Constructor<?> ctor = null;
+                    for (java.lang.reflect.Constructor<?> k : c.getDeclaredConstructors()) {
+                        if (k.getParameterCount() == 0) {
+                            ctor = k;
+                            break;
+                        }
+                    }
+                    Object fresh;
+                    if (ctor != null) {
+                        ctor.setAccessible(true);
+                        fresh = ctor.newInstance();
+                    } else {
+                        java.lang.reflect.Constructor<?> k = c.getDeclaredConstructors()[0];
+                        k.setAccessible(true);
+                        Object[] args = new Object[k.getParameterCount()];
+                        for (int i = 0; i < args.length; i++) {
+                            Class<?> pt = k.getParameterTypes()[i];
+                            args[i] = pt == int.class ? Integer.valueOf(0)
+                                    : pt == long.class ? Long.valueOf(0L) : null;
+                        }
+                        fresh = k.newInstance(args);
+                    }
+                    String now = runOnScheduler(fresh, 3000L);
+                    String delayed = runOnSchedulerDelayed(fresh, 300L, 3000L);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                            "fresh " + d[0] + " now=" + now + " delay300=" + delayed);
+                } catch (Throwable t) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                            "fresh " + d[0] + " failed: " + t.getClass().getSimpleName()
+                                    + " " + t.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                    "probeFresh failed: " + t.getClass().getSimpleName());
+        }
+    }
+
+    /** 投一个 300ms 延时任务，检验调度器是否支持延时（ExecutorScheduler 不支持）。 */
+    private static String runOnSchedulerDelayed(Object sch, long delayMs, long timeoutMs) {
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        try {
+            Object worker = sch.getClass().getMethod("createWorker").invoke(sch);
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    latch.countDown();
+                }
+            };
+            long t0 = System.currentTimeMillis();
+            worker.getClass().getMethod("schedule", Runnable.class, long.class,
+                    java.util.concurrent.TimeUnit.class)
+                    .invoke(worker, r, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            boolean ok = latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return ok ? "ran in " + (System.currentTimeMillis() - t0) + "ms" : "STUCK";
+        } catch (Throwable t) {
+            return "err " + t.getClass().getSimpleName();
+        }
+    }
+
+    /**
+     * 拆开 RxJava 的 Worker 看它内部的线程池到底什么状态。
+     *
+     * 已知：全新 new 的 SingleScheduler 投任务也不跑，而且进程里只有
+     * `RxSchedulerPurge`、`RxCachedWorker` 两条 Rx 线程，**没有** `RxSingleScheduler-*`。
+     * 说明 worker 内部的 ScheduledThreadPoolExecutor 根本没起线程 ——
+     * 最常见的原因是那个池已经 shutdown（submit 抛 RejectedExecutionException，
+     * 被 NewThreadWorker 内部 catch 掉，只转给 RxJavaPlugins.onError）。
+     * 所以这里直接读 executor 字段的 shutdown/terminated/queue/completed 状态，
+     * 并看 schedule 返回的是真的 Runnable 还是 EmptyDisposable。
+     */
+    private static void probeRxWorker(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            // 装一个错误处理器，把被吞掉的异常打出来
+            try {
+                Class<?> plugins = cl.loadClass("io.reactivex.plugins.RxJavaPlugins");
+                Class<?> consumer = cl.loadClass("io.reactivex.functions.Consumer");
+                Object h = java.lang.reflect.Proxy.newProxyInstance(
+                        cl, new Class<?>[]{consumer}, new java.lang.reflect.InvocationHandler() {
+                            @Override
+                            public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] a) {
+                                if ("accept".equals(m.getName()) && a != null && a.length > 0) {
+                                    Throwable t = (Throwable) a[0];
+                                    top.niunaijun.blackbox.utils.DiagLog.log("RxErr",
+                                            String.valueOf(t));
+                                }
+                                return null;
+                            }
+                        });
+                plugins.getMethod("setErrorHandler", consumer).invoke(null, h);
+            } catch (Throwable ignored) {
+            }
+            Class<?> ss = cl.loadClass("io.reactivex.internal.schedulers.SingleScheduler");
+            java.lang.reflect.Constructor<?> ctor = ss.getDeclaredConstructors()[0];
+            ctor.setAccessible(true);
+            Object sched = ctor.newInstance();
+            Object worker = sched.getClass().getMethod("createWorker").invoke(sched);
+            top.niunaijun.blackbox.utils.DiagLog.log("RxW",
+                    "worker=" + worker.getClass().getName());
+            // 字段名被混淆成单字母，只能全量扫一遍找执行器
+            java.util.concurrent.ExecutorService found = null;
+            Class<?> wc = worker.getClass();
+            while (wc != null && wc != Object.class) {
+                for (java.lang.reflect.Field f : wc.getDeclaredFields()) {
+                    Object v = null;
+                    try {
+                        f.setAccessible(true);
+                        v = f.get(worker);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    String d;
+                    if (v instanceof java.util.concurrent.ThreadPoolExecutor) {
+                        java.util.concurrent.ThreadPoolExecutor tp =
+                                (java.util.concurrent.ThreadPoolExecutor) v;
+                        d = tp.getClass().getSimpleName()
+                                + " shutdown=" + tp.isShutdown()
+                                + " terminated=" + tp.isTerminated()
+                                + " completed=" + tp.getCompletedTaskCount()
+                                + " queued=" + tp.getQueue().size()
+                                + " active=" + tp.getActiveCount()
+                                + " poolSize=" + tp.getPoolSize();
+                        found = tp;
+                    } else if (v instanceof java.util.concurrent.ExecutorService) {
+                        d = v.getClass().getName() + " " + v;
+                        found = (java.util.concurrent.ExecutorService) v;
+                    } else {
+                        d = describeValue(v);
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("RxW",
+                            "  field " + f.getType().getSimpleName() + " " + f.getName() + " = " + d);
+                }
+                wc = wc.getSuperclass();
+            }
+            final java.util.concurrent.CountDownLatch latch =
+                    new java.util.concurrent.CountDownLatch(1);
+            Object disp = worker.getClass().getMethod("schedule", Runnable.class)
+                    .invoke(worker, new Runnable() {
+                        @Override
+                        public void run() {
+                            latch.countDown();
+                        }
+                    });
+            String d = disp == null ? "null" : disp.getClass().getName();
+            boolean ran = latch.await(2500, java.util.concurrent.TimeUnit.MILLISECONDS);
+            top.niunaijun.blackbox.utils.DiagLog.log("RxW",
+                    "schedule -> " + d + " ran=" + ran);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("RxW",
                     "probe failed " + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
@@ -2945,6 +3283,8 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         // 修复后再测一遍，直接看 before/after
         fixRxSchedulers(app);
         probeRxSchedulers(app);
+        probeFreshSchedulers(app);
+        probeRxWorker(app);
         probeTtnetSync(app, "https://www.baidu.com/");
         probeTtnetSync(app, sLastDraweeUri);
         logMappedLibs();

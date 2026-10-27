@@ -21,6 +21,18 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 85,
+            versionName = "0.9.21",
+            title = "视频终于能正常播放：找到「线程池只收不做」的总根因",
+            highlights = listOf(
+                "总根因：字节的 bytex 会把每个池的线程工厂换成 ThreadFactoryProxy，再把新建线程包成 ThreadProxy；沙箱里包过之后线程就只挂着不执行任务，于是所有这类池都表现为「收下任务、不起线程、不报错」",
+                "受影响范围远超视频：视频/音频解码、RxJava 调度器、图片下载、接口请求队列全是同一个病，这也是前几轮反复遇到「线程全空闲、队列有任务、完成数 0」的原因",
+                "修法：把 SuperThreadPool 的启用位掩码清零（setEnableType(0)），代理直接返回原始线程；同时关掉「核心线程也允许超时」这个和保活时间冲突的开关",
+                "验证：RxJava 四个调度器从「3 秒 0 进度」变成 0ms 执行、延时任务精确 300ms；播放页有画面有字幕、音频 AudioTrack 状态 started、画面持续变化",
+                "另外把四个调度器也换成全新构造的原生实例（保留 delay/timer/interval 完整语义），避免沿用启动早期被污染的旧实例",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 84,
             versionName = "0.9.20",
             title = "修复 RxJava 调度器全部卡死：视频详情终于能加载",
