@@ -42,6 +42,8 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      * NewMiraClassloader），否则连应用自己的类都查不到。
      */
     private static volatile Application sTargetApp;
+    /** 当前可见的虚拟 Activity，用来遍历它的 View 树做取证。 */
+    private static volatile Activity sTopActivity;
 
     public static AppInstrumentation get() {
         if (sAppInstrumentation == null) {
@@ -798,6 +800,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     public void callActivityOnResume(Activity activity) {
         top.niunaijun.blackbox.utils.DiagLog.log("Life",
                 "onResume " + activity.getClass().getSimpleName());
+        sTopActivity = activity;
         super.callActivityOnResume(activity);
     }
 
@@ -1473,11 +1476,228 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         probeAppHttp(app);
         logFrescoState(app);
         probeFrescoFetch(app);
+        dumpViewTree();
         logMappedLibs();
         logNativeThreads();
         logAllThreads(app);
         exportAppSelfLogs(app);
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump end ===");
+    }
+
+    /**
+     * 遍历当前虚拟 Activity 的 View 树，逐个检查图片控件。
+     *
+     * 这一步用来区分两种截然不同的原因：
+     *   1. 控件压根没拿到图片（controller=null）→ UI 根本没发起请求；
+     *   2. 拿到了 controller 但 URL 是空的（uri=""）→ 响应里就没有图片地址；
+     *   3. URL 正常（uri=https://p3-novel.byteimg.com/...）却没图 → 加载被丢弃。
+     *
+     * 同时打印 `isShown()`：列表图片普遍"可见才加载"，虚拟窗口的可见性判断
+     * 一旦恒为 false，图片就永远不请求——这是最可疑的一条。
+     */
+    private static void dumpViewTree() {
+        Activity cur = sTopActivity;
+        if (cur == null) {
+            try {
+                cur = top.niunaijun.blackbox.app.BActivityThread.sTopActivity;
+            } catch (Throwable ignored) {
+            }
+        }
+        final Activity activity = cur;
+        if (activity == null) {
+            top.niunaijun.blackbox.utils.DiagLog.log("View", "no top activity");
+            return;
+        }
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+        final StringBuilder out = new StringBuilder();
+        final int[] stats = new int[]{0, 0, 0};   // 总控件数 / Drawee 数 / 有 URL 的
+        final java.util.List<Object> caught = new java.util.ArrayList<>();
+        Runnable walker = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    android.view.View decor = activity.getWindow() == null
+                            ? null : activity.getWindow().peekDecorView();
+                    if (decor == null) {
+                        decor = activity.findViewById(android.R.id.content);
+                    }
+                    walkViews(decor, 0, out, stats, caught);
+                } catch (Throwable t) {
+                    out.append("walk err ").append(t.getClass().getSimpleName()).append('\n');
+                } finally {
+                    latch.countDown();
+                }
+            }
+        };
+        try {
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                walker.run();
+            } else {
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(walker);
+                latch.await(4, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } catch (Throwable ignored) {
+        }
+        top.niunaijun.blackbox.utils.DiagLog.log("View",
+                "activity=" + activity.getClass().getSimpleName()
+                        + " views=" + stats[0] + " drawee=" + stats[1]
+                        + " withUrl=" + stats[2]);
+        for (String line : out.toString().split("\n")) {
+            if (line.length() > 0) {
+                top.niunaijun.blackbox.utils.DiagLog.log("View", line);
+            }
+        }
+        // 把从界面上抓到的真实 ImageRequest 原样重放一次：失败原因会被 Fresco
+        // 完整抛出来；成功则说明这条请求本身没问题（问题在"提交后没执行"）。
+        if (!caught.isEmpty()) {
+            replayImageRequests(caught);
+        }
+    }
+
+    private static void replayImageRequests(java.util.List<Object> requests) {
+        try {
+            Application app = sTargetApp;
+            if (app == null) {
+                return;
+            }
+            ClassLoader cl = app.getClassLoader();
+            Class<?> fresco = cl.loadClass("com.facebook.drawee.backends.pipeline.Fresco");
+            Object pipe = fresco.getMethod("getImagePipeline").invoke(null);
+            java.lang.reflect.Method fetch = null;
+            for (java.lang.reflect.Method m : pipe.getClass().getMethods()) {
+                if (!m.getName().equals("fetchDecodedImage")) {
+                    continue;
+                }
+                Class<?>[] p = m.getParameterTypes();
+                if (p.length == 2 && p[0].isInstance(requests.get(0))) {
+                    fetch = m;
+                    break;
+                }
+            }
+            if (fetch == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Replay", "no fetch method");
+                return;
+            }
+            int n = 0;
+            for (Object req : requests) {
+                if (n++ >= 2) {
+                    break;
+                }
+                String uri = "-";
+                try {
+                    Object u = req.getClass().getMethod("getSourceUri").invoke(req);
+                    uri = shortUrl(String.valueOf(u));
+                } catch (Throwable ignored) {
+                }
+                long t0 = System.currentTimeMillis();
+                Object ds = fetch.invoke(pipe, req, app);
+                boolean finished = false;
+                while (System.currentTimeMillis() - t0 < 8000L) {
+                    if (Boolean.TRUE.equals(ds.getClass().getMethod("isFinished").invoke(ds))) {
+                        finished = true;
+                        break;
+                    }
+                    Thread.sleep(100L);
+                }
+                long cost = System.currentTimeMillis() - t0;
+                if (!finished) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Replay",
+                            uri + " TIMEOUT 8s (排进管线但没人执行)");
+                    continue;
+                }
+                Object fail = ds.getClass().getMethod("getFailureCause").invoke(ds);
+                Object res = ds.getClass().getMethod("getResult").invoke(ds);
+                if (fail != null) {
+                    Throwable c = (Throwable) fail;
+                    top.niunaijun.blackbox.utils.DiagLog.log("Replay",
+                            uri + " FAIL " + cost + "ms " + c.getClass().getName()
+                                    + " " + c.getMessage());
+                    StackTraceElement[] st = c.getStackTrace();
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < Math.min(14, st.length); i++) {
+                        sb.append("\n      at ").append(st[i]);
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("Replay", "cause:" + sb);
+                } else {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Replay",
+                            uri + " OK " + cost + "ms result="
+                                    + (res == null ? "null" : res.getClass().getSimpleName()));
+                }
+                try {
+                    if (res instanceof java.io.Closeable) {
+                        ((java.io.Closeable) res).close();
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Replay",
+                    "failed " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    private static void walkViews(android.view.View v, int depth,
+                                  StringBuilder out, int[] stats, java.util.List<Object> caught) {
+        if (v == null || depth > 30 || stats[0] > 400) {
+            return;
+        }
+        stats[0]++;
+        String cls = v.getClass().getName();
+        if (cls.contains("Drawee") || cls.contains("drawee")) {
+            stats[1]++;
+            String ctl = "null";
+            String uri = "-";
+            try {
+                Object c = v.getClass().getMethod("getController").invoke(v);
+                if (c != null) {
+                    ctl = c.getClass().getSimpleName();
+                    try {
+                        Object req = c.getClass().getMethod("getImageRequest").invoke(c);
+                        if (req != null) {
+                            Object u = req.getClass().getMethod("getSourceUri").invoke(req);
+                            if (u != null) {
+                                uri = String.valueOf(u);
+                                stats[2]++;
+                                if (caught.size() < 3 && v.isShown()) {
+                                    caught.add(req);
+                                }
+                            } else {
+                                uri = "null";
+                            }
+                        }
+                    } catch (Throwable t) {
+                        uri = "?" + t.getClass().getSimpleName();
+                    }
+                }
+            } catch (Throwable t) {
+                ctl = "err:" + t.getClass().getSimpleName();
+            }
+            out.append(cls.substring(cls.lastIndexOf('.') + 1))
+                    .append(" shown=").append(v.isShown())
+                    .append(" vis=").append(v.getVisibility())
+                    .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
+                    .append(" ctl=").append(ctl)
+                    .append(" uri=").append(shortUrl(uri))
+                    .append('\n');
+            return;
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            int n = g.getChildCount();
+            for (int i = 0; i < n; i++) {
+                walkViews(g.getChildAt(i), depth + 1, out, stats, caught);
+            }
+        }
+    }
+
+    private static String shortUrl(String url) {
+        if (url == null) {
+            return "null";
+        }
+        int q = url.indexOf('?');
+        String s = q > 0 ? url.substring(0, q) : url;
+        return s.length() > 95 ? s.substring(0, 95) + "…" : s;
     }
 
     /**

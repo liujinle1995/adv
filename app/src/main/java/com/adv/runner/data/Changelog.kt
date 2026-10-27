@@ -21,8 +21,8 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
-            versionCode = 80,
-            versionName = "0.9.16",
+            versionCode = 81,
+            versionName = "0.9.17",
             title = "诊断升级：可导出虚拟应用自身日志",
             highlights = listOf(
                 "定位「图片封面全空、视频一直转圈，但接口数据正常」：沙箱里接口 JSON、TTNet 取网页都正常（实测 205ms 拿到完整 HTML），图片和播放器却不动",

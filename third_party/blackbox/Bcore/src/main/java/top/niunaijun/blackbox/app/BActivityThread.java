@@ -93,6 +93,8 @@ public class BActivityThread extends IBActivityThread.Stub {
     public static final String TAG = "BActivityThread";
 
     private static BActivityThread sBActivityThread;
+    /** 最近一次 onResume 的虚拟 Activity（诊断遍历 View 树用）。 */
+    public static volatile android.app.Activity sTopActivity;
     private AppBindData mBoundApplication;
     private Application mInitialApplication;
     private AppConfig mAppConfig;
@@ -512,6 +514,7 @@ public class BActivityThread extends IBActivityThread.Stub {
                         @Override
                         public void onActivityResumed(Activity a) {
                             log("onActivityResumed", a);
+                            sTopActivity = a;
                         }
 
                         @Override
