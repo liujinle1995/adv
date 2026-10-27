@@ -21,6 +21,19 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 83,
+            versionName = "0.9.19",
+            title = "新增请求级埋点，把视频问题缩到「页面零请求」",
+            highlights = listOf(
+                "新增请求埋点：每一条接口请求都会记录 URL、状态码、耗时。实测确认封面请求全部是 200（tplv 图片 77~190ms），图片修复稳定",
+                "把 TTNet 的 dispatcher 线程池也换掉：它和请求队列是同一个「只收不做」的问题，完成数一直是 0",
+                "新增启动任务链探针：一次可列出 109 个启动任务的完成情况，哪个模块初始化没跑一目了然",
+                "View 树新增 SurfaceView / TextureView 状态（Surface 是否有效、TextureView 是否可用），播放器类问题可以直接看这一行",
+                "视频问题已定位到边界：播放页 ShortSeriesActivity 正常创建并 resume，但整页 0 个网络请求、0 个 SurfaceView、0 个解码器线程；同一悬浮窗口里原生红果播放正常",
+                "已知未解决：视频仍黑屏转圈，下一步沿着「页面拿到 short_series_id 后为什么没发起播放请求」继续查",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 82,
             versionName = "0.9.18",
             title = "修复：封面/图片加载不出来（接管字节的请求队列）",

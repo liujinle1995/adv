@@ -751,6 +751,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     @Override
     public void callActivityOnCreate(Activity activity, Bundle icicle, PersistableBundle persistentState) {
         checkActivity(activity);
+        probeShortSeries(activity, activity == null ? null : activity.getIntent(), "onCreate");
         try {
             super.callActivityOnCreate(activity, icicle, persistentState);
         } catch (Throwable t) {
@@ -763,6 +764,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     @Override
     public void callActivityOnCreate(Activity activity, Bundle icicle) {
         checkActivity(activity);
+        probeShortSeries(activity, activity == null ? null : activity.getIntent(), "onCreate");
         try {
             super.callActivityOnCreate(activity, icicle);
         } catch (Throwable t) {
@@ -800,6 +802,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
 
     @Override
     public void callActivityOnResume(Activity activity) {
+        probeShortSeriesState(activity);
         top.niunaijun.blackbox.utils.DiagLog.log("Life",
                 "onResume " + activity.getClass().getSimpleName());
         sTopActivity = activity;
@@ -1791,6 +1794,8 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             f.setAccessible(true);
             Object cur = f.get(null);
             if (cur != null && cur.getClass().getName().contains("$Proxy")) {
+                replaceDispatcherPools(app);
+                installHttpTrace(app);
                 return;
             }
             Object proxy = java.lang.reflect.Proxy.newProxyInstance(
@@ -1799,19 +1804,135 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             top.niunaijun.blackbox.utils.DiagLog.log("Http",
                     "request queue -> adv-net (was "
                             + (cur == null ? "null" : cur.getClass().getSimpleName()) + ")");
+            // 图片走的是 SsHttpExecutor（已接管），但详情/播放这类请求可能直接走
+            // dispatcher 的线程池，那边同样是 done=0 的「只收不做」，一并换掉。
+            replaceDispatcherPools(app);
+            installHttpTrace(app);
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Http",
                     "installRequestQueue failed: " + t.getClass().getSimpleName()
                             + " " + t.getMessage());
             replaceDispatcherPools(app);
+            installHttpTrace(app);
         }
     }
+
+    private static volatile boolean sPoolsReplaced;
 
     /**
      * 兜底：把 dispatcher.d 里那 5 个「收任务不干活」的池换成普通线程池。
      * 实测它们 size=8 active=8 done=0，队列里有任务但永远不完成。
      */
+    /** 记录每一条接口请求的 URL / 结果 / 耗时（字节拦截器是接口，可用 Proxy 顶上）。 */
+    private static void installHttpTrace(final Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> itf = cl.loadClass("com.bytedance.retrofit2.intercept.Interceptor");
+            Class<?> ru = cl.loadClass("com.bytedance.ttnet.utils.RetrofitUtils");
+            java.lang.reflect.Field lf = ru.getDeclaredField("sInterceptors");
+            lf.setAccessible(true);
+            Object list = lf.get(null);
+            if (list instanceof java.util.List) {
+                for (Object o : (java.util.List<?>) list) {
+                    if (o != null && o.getClass().getName().contains("$Proxy")) {
+                        return;
+                    }
+                }
+            }
+            Object proxy = java.lang.reflect.Proxy.newProxyInstance(
+                    cl, new Class<?>[]{itf}, new SsInterceptorTrace(cl));
+            boolean ok = false;
+            for (java.lang.reflect.Method m : ru.getMethods()) {
+                if (!m.getName().equals("addInterceptor") || m.getParameterCount() != 1) {
+                    continue;
+                }
+                m.setAccessible(true);
+                m.invoke(null, proxy);
+                ok = true;
+                break;
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Trace", "interceptor installed=" + ok);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Trace",
+                    "install failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    private static final class SsInterceptorTrace implements java.lang.reflect.InvocationHandler {
+        private final ClassLoader cl;
+
+        SsInterceptorTrace(ClassLoader cl) {
+            this.cl = cl;
+        }
+
+        @Override
+        public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+            String name = method.getName();
+            if ("toString".equals(name)) {
+                return "adv-http-trace";
+            }
+            if ("hashCode".equals(name)) {
+                return System.identityHashCode(proxy);
+            }
+            if ("equals".equals(name)) {
+                return args != null && args.length == 1 && proxy == args[0];
+            }
+            if (args == null || args.length == 0) {
+                return null;
+            }
+            Object chain = args[0];
+            long t0 = System.currentTimeMillis();
+            String url = "?";
+            Object req = null;
+            try {
+                Class<?> chainItf = cl.loadClass(
+                        "com.bytedance.retrofit2.intercept.Interceptor$Chain");
+                req = chainItf.getMethod("request").invoke(chain);
+                if (req != null) {
+                    try {
+                        url = String.valueOf(req.getClass().getMethod("getUrl").invoke(req));
+                    } catch (Throwable e1) {
+                        try {
+                            url = String.valueOf(req.getClass().getMethod("url").invoke(req));
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                Class<?> reqCls = cl.loadClass("com.bytedance.retrofit2.client.Request");
+                Object resp = chainItf.getMethod("proceed", reqCls).invoke(chain, req);
+                String code = "?";
+                if (resp != null) {
+                    try {
+                        code = String.valueOf(resp.getClass().getMethod("code").invoke(resp));
+                    } catch (Throwable ignored) {
+                    }
+                }
+                top.niunaijun.blackbox.utils.DiagLog.log("Trace",
+                        shortUrl(url) + " -> code=" + code
+                                + " " + (System.currentTimeMillis() - t0) + "ms");
+                return resp;
+            } catch (Throwable t) {
+                Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
+                        && t.getCause() != null) ? t.getCause() : t;
+                top.niunaijun.blackbox.utils.DiagLog.log("Trace",
+                        shortUrl(url) + " FAIL " + c.getClass().getSimpleName()
+                                + ": " + c.getMessage()
+                                + " " + (System.currentTimeMillis() - t0) + "ms");
+                if (c instanceof RuntimeException) {
+                    throw (RuntimeException) c;
+                }
+                if (c instanceof Error) {
+                    throw (Error) c;
+                }
+                throw new RuntimeException(c);
+            }
+        }
+    }
+
     private static void replaceDispatcherPools(Application app) {
+        if (sPoolsReplaced) {
+            return;
+        }
         try {
             ClassLoader cl = app.getClassLoader();
             Class<?> dCls = cl.loadClass("com.bytedance.frameworks.baselib.network.dispatcher.d");
@@ -1828,6 +1949,16 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                     continue;
                 }
                 f.setAccessible(true);
+                Object old = f.get(d);
+                if (old instanceof java.util.concurrent.ThreadPoolExecutor) {
+                    java.util.concurrent.ThreadPoolExecutor op =
+                            (java.util.concurrent.ThreadPoolExecutor) old;
+                    top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                            "old pool " + f.getName() + " size=" + op.getPoolSize()
+                                    + " active=" + op.getActiveCount()
+                                    + " queued=" + op.getQueue().size()
+                                    + " done=" + op.getCompletedTaskCount());
+                }
                 java.util.concurrent.ThreadPoolExecutor pool =
                         new java.util.concurrent.ThreadPoolExecutor(
                                 2, 8, 30L, java.util.concurrent.TimeUnit.SECONDS,
@@ -1847,6 +1978,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 f.set(d, pool);
                 n++;
             }
+            sPoolsReplaced = true;
             top.niunaijun.blackbox.utils.DiagLog.log("Http", "dispatcher pools replaced: " + n);
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Http",
@@ -1991,10 +2123,179 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         }
     }
 
+    /**
+     * 列出启动任务链的完成情况。
+     *
+     * com.dragon.read.app.launch.m 用 Map<String, m$c> 记录每个启动任务：
+     * m$c.a=名称, b=开始时间, c=结束时间(0 表示没跑完), d=是否完成。
+     * 沙箱里很多模块初始化是"投递到线程池后就不再管"，任务没跑完就静默失效，
+     * 界面上表现为某个页面永远停在骨架屏——这张表能直接指出来是谁没跑。
+     */
+    /**
+     * 播放页（ShortSeriesActivity）的数据是调用方通过静态字段 S 传进来的，
+     * 页面 onCreate 里 `this.G = S; S = null;`。所以只要在 newActivity 这一刻
+     * 看 S 是不是空，就能区分「调用方没给数据」和「有数据但没发请求」。
+     */
+    private static void probeShortSeries(Activity activity, Intent intent, String phase) {
+        try {
+            if (activity == null) {
+                return;
+            }
+            String cls = activity.getClass().getName();
+            if (!cls.contains("ShortSeries")) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder(phase).append(' ').append(cls);
+            try {
+                android.os.Bundle b = intent == null ? null : intent.getExtras();
+                sb.append(" extras=").append(b == null ? "null" : b.keySet().toString());
+            } catch (Throwable t) {
+                sb.append(" extrasErr=").append(t.getClass().getSimpleName());
+            }
+            java.lang.reflect.Field f = null;
+            Class<?> c = activity.getClass();
+            while (c != null && f == null) {
+                try {
+                    f = c.getDeclaredField("S");
+                } catch (Throwable ignored) {
+                    c = c.getSuperclass();
+                }
+            }
+            if (f == null) {
+                sb.append(" S=<no field>");
+            } else {
+                f.setAccessible(true);
+                Object v = f.get(null);
+                sb.append(" S=").append(v == null ? "null" : v.getClass().getSimpleName());
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Play", sb.toString());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** onResume 时再看一眼：数据 G、播放管理器 w、播放容器 i 是否存在。 */
+    private static void probeShortSeriesState(Activity a) {
+        try {
+            if (a == null || !a.getClass().getName().contains("ShortSeries")) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder("resume ").append(a.getClass().getSimpleName());
+            for (String fn : new String[]{"G", "w", "i"}) {
+                Object v = readInstanceField(a, fn);
+                sb.append(' ').append(fn).append('=')
+                        .append(v == null ? "null" : v.getClass().getSimpleName());
+                if (v instanceof android.view.ViewGroup) {
+                    sb.append("(children=").append(((android.view.ViewGroup) v).getChildCount()).append(')');
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Play", sb.toString());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Object readInstanceField(Object target, String name) {
+        Class<?> c = target.getClass();
+        while (c != null) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(target);
+            } catch (Throwable t) {
+                c = c.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    private static void dumpLaunchTasks(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> m = cl.loadClass("com.dragon.read.app.launch.m");
+            // f: CopyOnWriteArrayList<m$c>  —— 任务记录本体
+            try {
+                java.lang.reflect.Field ff = m.getDeclaredField("f");
+                ff.setAccessible(true);
+                Object v = ff.get(null);
+                if (v instanceof java.util.List) {
+                    java.util.List<?> list = (java.util.List<?>) v;
+                    top.niunaijun.blackbox.utils.DiagLog.log("Launch", "m.f size=" + list.size());
+                    int n = 0;
+                    for (Object o : list) {
+                        logLaunchRecord("f", String.valueOf(n++), o);
+                        if (n >= 300) {
+                            break;
+                        }
+                    }
+                } else {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Launch",
+                            "m.f = " + (v == null ? "null" : v.getClass().getName()));
+                }
+            } catch (Throwable t) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Launch",
+                        "m.f failed: " + t.getClass().getSimpleName());
+            }
+            // g: SparseArrayCompat
+            try {
+                java.lang.reflect.Field fg = m.getDeclaredField("g");
+                fg.setAccessible(true);
+                Object g = fg.get(null);
+                if (g != null) {
+                    java.lang.reflect.Method size = g.getClass().getMethod("size");
+                    int sz = ((Number) size.invoke(g)).intValue();
+                    top.niunaijun.blackbox.utils.DiagLog.log("Launch", "m.g size=" + sz);
+                    java.lang.reflect.Method valueAt = g.getClass().getMethod("valueAt", int.class);
+                    for (int i = 0; i < Math.min(sz, 200); i++) {
+                        logLaunchRecord("g", String.valueOf(i), valueAt.invoke(g, i));
+                    }
+                }
+            } catch (Throwable t) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Launch",
+                        "m.g failed: " + t.getClass().getSimpleName());
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Launch",
+                    "dump failed: " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static void logLaunchRecord(String prefix, Object key, Object val) {
+        String name = String.valueOf(key);
+        long start = -1L;
+        long end = -1L;
+        boolean done = false;
+        try {
+            if (val == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Launch", prefix + " " + name + " = null");
+                return;
+            }
+            java.lang.reflect.Field fa = val.getClass().getDeclaredField("a");
+            fa.setAccessible(true);
+            name = String.valueOf(fa.get(val));
+            java.lang.reflect.Field fb = val.getClass().getDeclaredField("b");
+            fb.setAccessible(true);
+            start = ((Number) fb.get(val)).longValue();
+            java.lang.reflect.Field fc = val.getClass().getDeclaredField("c");
+            fc.setAccessible(true);
+            end = ((Number) fc.get(val)).longValue();
+            java.lang.reflect.Field fd = val.getClass().getDeclaredField("d");
+            fd.setAccessible(true);
+            done = Boolean.TRUE.equals(fd.get(val));
+        } catch (Throwable ignored) {
+        }
+        if (end <= 0L) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Launch",
+                    "UNFINISHED " + name + " started=" + (start > 0) + " done=" + done);
+        } else {
+            top.niunaijun.blackbox.utils.DiagLog.log("Launch",
+                    "ok " + name + " " + (end - start) + "ms");
+        }
+    }
+
     private static void dumpDiagnostics(Application app, String reason) {
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump begin (" + reason + ") ===");
         installRequestQueue(app);
         probeThreadPriority();
+        dumpLaunchTasks(app);
         logExecutorState(app);
         logNetworkState(app);
         probeAppHttp(app);
@@ -2050,6 +2351,13 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                         decor = activity.findViewById(android.R.id.content);
                     }
                     walkViews(decor, 0, out, stats, caught);
+                    if (decor != null) {
+                        out.append("decor ").append(decor.getWidth()).append('x').append(decor.getHeight())
+                                .append(" attached=").append(decor.isAttachedToWindow())
+                                .append(" activity=")
+                                .append(activity.getClass().getName())
+                                .append('\n');
+                    }
                 } catch (Throwable t) {
                     out.append("walk err ").append(t.getClass().getSimpleName()).append('\n');
                 } finally {
@@ -2209,6 +2517,30 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                     .append(" uri=").append(shortUrl(uri))
                     .append('\n');
             return;
+        }
+        // 播放器只在 Surface 有效后才开始拉流，所以这块必须单独记
+        if (v instanceof android.view.SurfaceView || v instanceof android.view.TextureView) {
+            String surf;
+            try {
+                if (v instanceof android.view.SurfaceView) {
+                    android.view.SurfaceHolder h = ((android.view.SurfaceView) v).getHolder();
+                    android.view.Surface s = h == null ? null : h.getSurface();
+                    surf = s == null ? "surface=null" : "valid=" + s.isValid();
+                } else {
+                    android.view.TextureView tv = (android.view.TextureView) v;
+                    surf = "available=" + tv.isAvailable()
+                            + " st=" + (tv.getSurfaceTexture() != null)
+                            + " attached=" + tv.isAttachedToWindow();
+                }
+            } catch (Throwable t) {
+                surf = "err:" + t.getClass().getSimpleName();
+            }
+            out.append(cls.substring(cls.lastIndexOf('.') + 1))
+                    .append(" shown=").append(v.isShown())
+                    .append(" vis=").append(v.getVisibility())
+                    .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
+                    .append(" [").append(surf).append(']')
+                    .append('\n');
         }
         if (v instanceof android.view.ViewGroup) {
             android.view.ViewGroup g = (android.view.ViewGroup) v;
@@ -3000,6 +3332,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             Activity activity = super.newActivity(cl, className, intent);
             top.niunaijun.blackbox.utils.DiagLog.log("Inst",
                     "newActivity ok -> " + activity.getClass().getName());
+            probeShortSeries(activity, intent, "newActivity");
             return activity;
         } catch (ClassNotFoundException e) {
             top.niunaijun.blackbox.utils.DiagLog.log("Inst",
