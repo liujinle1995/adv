@@ -21,6 +21,18 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 84,
+            versionName = "0.9.20",
+            title = "修复 RxJava 调度器全部卡死：视频详情终于能加载",
+            highlights = listOf(
+                "找到并修掉一个大问题：沙箱里 RxJava 的 io / computation / single / newThread 四个调度器投进去的任务永不执行（实测 3 秒 0 进度），只有主线程正常",
+                "同时验证排除了 JDK 层：裸线程、ThreadPoolExecutor、ScheduledThreadPoolExecutor（含 500ms 延时任务）、ForkJoinPool、System.nanoTime 全部正常，所以坏的是应用改过的 RxJava 调度器配置",
+                "修法：用自建线程池构造 Scheduler，通过 RxJavaPlugins 的四个 handler 接管；启动时和 Application.onCreate 之后各压一次，防止被应用自己的初始化覆盖",
+                "效果：视频详情与播放模型的接口全部回来了（video_model、multi_video_detail、multi_video_model 均 200，此前是 0 请求），播放页从纯黑变成有真实内容",
+                "顺带把诊断补全：视频详情预取缓存命中情况、Rx 调度器前后对比、AudioTrack/MediaCodec 能否创建、SurfaceView 能否拿到有效 Surface",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 83,
             versionName = "0.9.19",
             title = "新增请求级埋点，把视频问题缩到「页面零请求」",

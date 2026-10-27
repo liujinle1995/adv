@@ -44,6 +44,8 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     private static volatile Application sTargetApp;
     /** View 树里最后看到的图片地址，供 TTNet 直连探针复用。 */
     private static volatile String sLastDraweeUri;
+    /** 最近一次打开的播放页携带的 short_series_id，用于回查视频详情预取缓存。 */
+    private static volatile String sLastSeriesId;
     /** 当前可见的虚拟 Activity，用来遍历它的 View 树做取证。 */
     private static volatile Activity sTopActivity;
 
@@ -902,6 +904,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             throw t;
         }
         top.niunaijun.blackbox.utils.DiagLog.log("Inst", "application onCreate RETURNED");
+        // 应用自己的初始化可能又装了一遍 RxJavaPlugins，这里再压一次，确保
+        // 后续所有 Schedulers.io() 都用我们可用的线程池
+        fixRxSchedulers(app);
         advAppCreateDone = true;
         if (app != null) ensureRpcInit(app);
     }
@@ -971,6 +976,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                     initHttpStack(app);
                     initRpcNow(app);
                     installRequestQueue(app);
+                    // RxJava 调度器在这里就是坏的，必须早于应用发出的第一条
+                    // Schedulers.io() 链路（视频详情预取、各种 Rx 化的接口）
+                    fixRxSchedulers(app);
                 }
             }, "adv-boot-init");
             t.setDaemon(true);
@@ -2149,6 +2157,12 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             try {
                 android.os.Bundle b = intent == null ? null : intent.getExtras();
                 sb.append(" extras=").append(b == null ? "null" : b.keySet().toString());
+                if (b != null) {
+                    String sid = b.getString("short_series_id");
+                    if (sid != null && sid.length() > 0) {
+                        sLastSeriesId = sid;
+                    }
+                }
             } catch (Throwable t) {
                 sb.append(" extrasErr=").append(t.getClass().getSimpleName());
             }
@@ -2191,6 +2205,625 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             top.niunaijun.blackbox.utils.DiagLog.log("Play", sb.toString());
         } catch (Throwable ignored) {
         }
+    }
+
+    /**
+     * 把当前顶层 Activity 的**所有实例字段**连同静态字段一起导出来。
+     *
+     * 为什么必须这么做：播放页（ShortSeriesActivity）的播放管理器是
+     * `private 播放器接口 w = 单例.j();`，页面数据走静态字段 S 传入。
+     * 只要其中任何一个为 null，页面就会一句请求都不发、一个 Surface 都不建、
+     * 一个解码线程都不起 —— 和实测现象完全一致。
+     * 反编译里的类名被 jadx 改写过（d0 / x 都是占位名），所以只能在运行时按
+     * 真实对象读字段，不能靠静态分析猜。
+     */
+    /**
+     * 回查「视频详情预取缓存」。
+     *
+     * 播放页的数据不是自己请求的：`ShortSeriesImpl.openShortSeriesActivity` 里
+     * 用 `vy3.v0.a(launchArgs)` 从 g0 的预取缓存里取 SaasVideoDetailModel，
+     * 取不到就直接 `return null`（只打一行 warn），然后
+     * `ShortSeriesActivity.R.a(null)` 把静态字段写成 null，页面于是：
+     *   只跑 prePlayVideo→「vid is null」提前返回 → 不建视频 View → 不发任何请求。
+     * 所以只要确认这里是 MISS，就能解释整条现象链。
+     */
+    private static void probeVideoDetailCache(Application app) {
+        final String sid = sLastSeriesId;
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> g0 = cl.loadClass("com.dragon.read.component.shortvideo.impl.prefetch.g0");
+            java.lang.reflect.Field fl = g0.getDeclaredField("l");
+            fl.setAccessible(true);
+            Object inst = fl.get(null);
+            top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                    "g0.l=" + (inst == null ? "null" : inst.getClass().getSimpleName())
+                            + " seriesId=" + sid);
+            if (inst == null) {
+                return;
+            }
+            // g0.l 是伴生对象（g0$a），真正的单例要再调一次 a()
+            if (!g0.isInstance(inst)) {
+                try {
+                    Object single = inst.getClass().getMethod("a").invoke(inst);
+                    if (single != null) {
+                        inst = single;
+                    }
+                } catch (Throwable t) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                            "resolve singleton failed: " + t.getClass().getSimpleName());
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                    "g0 = " + inst.getClass().getName());
+            // 缓存本体：g0.a，把它的字段一并打出来（容量/条目数）
+            Object inner = readInstanceField(inst, "a");
+            if (inner != null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                        "g0.a=" + inner.getClass().getName());
+                for (java.lang.reflect.Field f : inner.getClass().getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        continue;
+                    }
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(inner);
+                        String d;
+                        if (v instanceof java.util.Map) {
+                            java.util.Map<?, ?> mm = (java.util.Map<?, ?>) v;
+                            d = "Map(size=" + mm.size() + " keys="
+                                    + truncate(String.valueOf(mm.keySet()), 160) + ")";
+                        } else if (v instanceof java.util.Collection) {
+                            d = "Collection(size=" + ((java.util.Collection<?>) v).size() + ")";
+                        } else {
+                            d = describeValue(v);
+                        }
+                        top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                                "  " + f.getType().getSimpleName() + " " + f.getName() + " = " + d);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            if (sid != null) {
+                try {
+                    java.lang.reflect.Method x = g0.getMethod("x", String.class);
+                    long t0 = System.currentTimeMillis();
+                    Object m = x.invoke(inst, sid);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                            "x(" + sid + ") -> " + (m == null ? "MISS" : "HIT")
+                                    + " in " + (System.currentTimeMillis() - t0) + "ms");
+                } catch (Throwable t) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                            "x() failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Cache",
+                    "probe failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /**
+     * 验证 RxJava 各调度器在本进程里到底能不能跑任务。
+     *
+     * 视频详情预取（g0）整条链路是
+     *   ShortSeriesApi.getRequestManager().e(req).subscribeOn(Schedulers.io())
+     *   .observeOn(AndroidSchedulers.mainThread()).subscribe(...)
+     * 实测缓存里 d/e/f 三个 Map 全是 size=0，但 g 队列里有 4 个
+     * "task_prefetching" 标记一直没被消费 —— 也就是 4 个预取任务开了但都没完成。
+     * 所以先确认调度器本身是否可用：往每个调度器投一个任务，看它跑不跑。
+     */
+    private static void probeRxSchedulers(Application app) {
+        try {
+            final ClassLoader cl = app.getClassLoader();
+            Class<?> schedulers = cl.loadClass("io.reactivex.schedulers.Schedulers");
+            for (String name : new String[]{"io", "computation", "single", "newThread"}) {
+                try {
+                    Object sch = schedulers.getMethod(name).invoke(null);
+                    String r = runOnScheduler(sch, 3000L);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                            name + " [" + sch.getClass().getName() + "] " + r);
+                } catch (Throwable t) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                            name + " failed: " + t.getClass().getSimpleName()
+                                    + " " + t.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                    "Schedulers class missing: " + t.getClass().getSimpleName());
+        }
+        // AndroidSchedulers.mainThread()：UI 回调都排在它上面，卡住会表现为"数据有但不刷新"
+        try {
+            final ClassLoader cl = app.getClassLoader();
+            Class<?> as = cl.loadClass("io.reactivex.android.schedulers.AndroidSchedulers");
+            Object sch = as.getMethod("mainThread").invoke(null);
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                    "mainThread " + runOnScheduler(sch, 3000L));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                    "mainThread failed: " + t.getClass().getSimpleName()
+                            + " " + t.getMessage());
+        }
+    }
+
+    /** 往一个 RxJava Scheduler 上投一个空任务，返回是否在超时前跑完。 */
+    private static String runOnScheduler(Object sch, long timeoutMs) {
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        final String[] thread = new String[]{"?"};
+        try {
+            Object worker = sch.getClass().getMethod("createWorker").invoke(sch);
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    thread[0] = Thread.currentThread().getName();
+                    latch.countDown();
+                }
+            };
+            long t0 = System.currentTimeMillis();
+            worker.getClass().getMethod("schedule", Runnable.class).invoke(worker, r);
+            boolean ok = latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return (ok ? "ran=" + thread[0] : "STUCK")
+                    + " in " + (System.currentTimeMillis() - t0) + "ms";
+        } catch (Throwable t) {
+            return "err " + t.getClass().getSimpleName() + " " + t.getMessage();
+        }
+    }
+
+    /**
+     * 逐个验证「造线程 / 跑任务 / 定时任务」这些底层能力。
+     *
+     * RxJava 的 IoScheduler 全部走 NewThreadWorker → SchedulerPoolFactory
+     * → ScheduledThreadPoolExecutor，所以只要 ScheduledThreadPoolExecutor 或
+     * System.nanoTime() 在这个进程里不正常，RxJava 的 io/computation/single/newThread
+     * 就会一起永久卡住（实测四个全 STUCK，只有 mainThread 正常）。
+     * 而预取视频详情正是跑在 Schedulers.io() 上，所以这一步能锁定根因层级。
+     */
+    private static void probePlainExecutors() {
+        // 1) System.nanoTime 是否单调递增（ScheduledThreadPoolExecutor 的延时全靠它）
+        try {
+            long a = System.nanoTime();
+            Thread.sleep(300L);
+            long b = System.nanoTime();
+            long deltaMs = (b - a) / 1000000L;
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "nanoTime delta=" + deltaMs + "ms " + (deltaMs >= 250 ? "OK" : "SUSPECT"));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "nanoTime err " + t);
+        }
+        // 2) 裸线程
+        final java.util.concurrent.CountDownLatch l0 = new java.util.concurrent.CountDownLatch(1);
+        try {
+            Thread t = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    l0.countDown();
+                }
+            }, "adv-probe-plain");
+            t.start();
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "plainThread ran=" + l0.await(2, java.util.concurrent.TimeUnit.SECONDS));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "plainThread err " + t.getClass().getSimpleName());
+        }
+        // 3) 普通 ThreadPoolExecutor
+        try {
+            java.util.concurrent.ThreadPoolExecutor p =
+                    new java.util.concurrent.ThreadPoolExecutor(1, 1, 0L,
+                            java.util.concurrent.TimeUnit.SECONDS,
+                            new java.util.concurrent.LinkedBlockingQueue<Runnable>());
+            String r = submitAndWait(p, 2000L);
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "threadPool " + r);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "threadPool err " + t.getClass().getSimpleName());
+        }
+        // 4) ScheduledThreadPoolExecutor —— RxJava 的地基
+        try {
+            java.util.concurrent.ScheduledThreadPoolExecutor sp =
+                    new java.util.concurrent.ScheduledThreadPoolExecutor(1);
+            String r = submitAndWait(sp, 2000L);
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "scheduledPool " + r);
+            // 延时 0 的定时任务也要能跑
+            final java.util.concurrent.CountDownLatch l2 = new java.util.concurrent.CountDownLatch(1);
+            sp.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    l2.countDown();
+                }
+            }, 0L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "scheduledDelay0 ran=" + l2.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            // 延时 500ms 的定时任务（DelayedWorkQueue 真正用 nanoTime 的地方）
+            final java.util.concurrent.CountDownLatch l3 = new java.util.concurrent.CountDownLatch(1);
+            sp.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    l3.countDown();
+                }
+            }, 500L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "scheduledDelay500 ran=" + l3.await(4, java.util.concurrent.TimeUnit.SECONDS));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "scheduledPool err " + t.getClass().getSimpleName());
+        }
+        // 5) ForkJoinPool / CompletableFuture
+        try {
+            final java.util.concurrent.CountDownLatch l4 = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CompletableFuture.runAsync(new Runnable() {
+                @Override
+                public void run() {
+                    l4.countDown();
+                }
+            });
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec",
+                    "commonPool ran=" + l4.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Exec", "commonPool err " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static String submitAndWait(java.util.concurrent.ExecutorService p, long ms) {
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        final String[] tn = new String[]{"?"};
+        try {
+            p.execute(new Runnable() {
+                @Override
+                public void run() {
+                    tn[0] = Thread.currentThread().getName();
+                    latch.countDown();
+                }
+            });
+            boolean ok = latch.await(ms, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return (ok ? "ran=" + tn[0] : "STUCK") + " " + p;
+        } catch (Throwable t) {
+            return "err " + t.getClass().getSimpleName();
+        }
+    }
+
+    // ================= RxJava 调度器修复 =================
+
+    private static volatile boolean sRxPoolsReady;
+    private static volatile java.util.concurrent.Executor sRxIoPool;
+    private static volatile java.util.concurrent.Executor sRxComputePool;
+    private static volatile java.util.concurrent.Executor sRxSinglePool;
+
+    private static java.util.concurrent.Executor newAdvExecutor(final String name) {
+        return java.util.concurrent.Executors.newCachedThreadPool(
+                new java.util.concurrent.ThreadFactory() {
+                    private final java.util.concurrent.atomic.AtomicInteger seq =
+                            new java.util.concurrent.atomic.AtomicInteger(1);
+
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, name + "-" + seq.getAndIncrement());
+                        t.setDaemon(true);
+                        return t;
+                    }
+                });
+    }
+
+    /**
+     * 把 RxJava 的 io / computation / single / newThread 全部接到自建线程池上。
+     *
+     * 实测：沙箱里 `Schedulers.io()`、`computation()`、`single()`、`newThread()`
+     * 投任务全部 3 秒不执行（STUCK），而 `AndroidSchedulers.mainThread()`
+     * 0~1ms 就执行。同时验证了原生 `Thread`、`ThreadPoolExecutor`、
+     * `ScheduledThreadPoolExecutor`（含 500ms 延时任务）、ForkJoinPool 全部正常。
+     * 也就是说坏的不是 JDK 执行器，而是 RxJava 被改过的调度器（应用侧
+     * RxJavaPlugins 装过 handler）。
+     *
+     * 这一层坏了影响面极大：视频详情预取
+     * `getRequestManager().e(req).subscribeOn(Schedulers.io())` 永远不执行，
+     * 于是预取缓存永远是空的，播放页拿不到数据只能空转。
+     */
+    private static void fixRxSchedulers(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> schedulersCls = cl.loadClass("io.reactivex.schedulers.Schedulers");
+            Class<?> pluginsCls = cl.loadClass("io.reactivex.plugins.RxJavaPlugins");
+            Class<?> functionCls = cl.loadClass("io.reactivex.functions.Function");
+            Class<?> executorCls = java.util.concurrent.Executor.class;
+            java.lang.reflect.Method from = schedulersCls.getMethod("from", executorCls);
+
+            if (!sRxPoolsReady) {
+                sRxIoPool = newAdvExecutor("adv-rx-io");
+                sRxComputePool = newAdvExecutor("adv-rx-cmp");
+                sRxSinglePool = newAdvExecutor("adv-rx-single");
+                sRxPoolsReady = true;
+            }
+            final Object[] target = new Object[]{
+                    from.invoke(null, sRxIoPool),
+                    from.invoke(null, sRxComputePool),
+                    from.invoke(null, sRxSinglePool),
+                    from.invoke(null, sRxIoPool),
+            };
+            String[] setters = {
+                    "setIoSchedulerHandler",
+                    "setComputationSchedulerHandler",
+                    "setSingleSchedulerHandler",
+                    "setNewThreadSchedulerHandler",
+            };
+            int ok = 0;
+            for (int i = 0; i < setters.length; i++) {
+                final Object sch = target[i];
+                Object handler = java.lang.reflect.Proxy.newProxyInstance(
+                        cl, new Class<?>[]{functionCls}, new java.lang.reflect.InvocationHandler() {
+                            @Override
+                            public Object invoke(Object proxy, java.lang.reflect.Method method,
+                                                 Object[] args) {
+                                if ("apply".equals(method.getName())) {
+                                    return sch;
+                                }
+                                if ("toString".equals(method.getName())) {
+                                    return "adv-rx-handler";
+                                }
+                                if ("equals".equals(method.getName())) {
+                                    return false;
+                                }
+                                if ("hashCode".equals(method.getName())) {
+                                    return System.identityHashCode(proxy);
+                                }
+                                return null;
+                            }
+                        });
+                pluginsCls.getMethod(setters[i], functionCls).invoke(null, handler);
+                ok++;
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx", "scheduler handlers installed=" + ok);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Rx",
+                    "fix failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /**
+     * 播放器卡在"首帧后不动"时，先分辨是**音频输出**还是**解码器**这一层坏了。
+     *
+     * 实测现象：播放页进入后能拿到播放模型（video_model / multi_video_model 全 200），
+     * 但不产生任何视频数据流量，画面停在首帧、`dumpsys audio` 里也没有本应用的 AudioTrack。
+     * 音视频不同步的播放器在拿不到音频时钟时会永远停在第一帧，所以先验证 AudioTrack
+     * 能不能创建并写入，再验证 MediaCodec 能不能创建。
+     */
+    private static void probeMediaStack() {
+        // 1) AudioTrack：能不能建、能不能写
+        try {
+            int sr = 44100;
+            int minBuf = android.media.AudioTrack.getMinBufferSize(sr,
+                    android.media.AudioFormat.CHANNEL_OUT_STEREO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT);
+            android.media.AudioTrack t = new android.media.AudioTrack(
+                    android.media.AudioManager.STREAM_MUSIC, sr,
+                    android.media.AudioFormat.CHANNEL_OUT_STEREO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT,
+                    Math.max(minBuf, 4096),
+                    android.media.AudioTrack.MODE_STREAM);
+            String state = t.getState() == android.media.AudioTrack.STATE_INITIALIZED
+                    ? "INITIALIZED" : ("state=" + t.getState());
+            String playRes = "n/a";
+            String writeRes = "n/a";
+            try {
+                t.play();
+                playRes = "ok";
+            } catch (Throwable e) {
+                playRes = e.getClass().getSimpleName() + ":" + e.getMessage();
+            }
+            try {
+                short[] buf = new short[2048];
+                int w = t.write(buf, 0, buf.length);
+                writeRes = "wrote=" + w;
+            } catch (Throwable e) {
+                writeRes = e.getClass().getSimpleName() + ":" + e.getMessage();
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Media",
+                    "AudioTrack " + state + " minBuf=" + minBuf
+                            + " play=" + playRes + " write=" + writeRes);
+            try {
+                t.release();
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Media",
+                    "AudioTrack FAILED " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        // 2) MediaCodec：能不能列出/创建解码器
+        try {
+            int n = android.media.MediaCodecList.getCodecCount();
+            top.niunaijun.blackbox.utils.DiagLog.log("Media", "codecCount=" + n);
+            for (String mime : new String[]{"video/avc", "video/hevc", "audio/mp4a-latm"}) {
+                try {
+                    android.media.MediaCodec c =
+                            android.media.MediaCodec.createDecoderByType(mime);
+                    String name = c == null ? "null" : c.getName();
+                    top.niunaijun.blackbox.utils.DiagLog.log("Media",
+                            "decoder " + mime + " -> " + name);
+                    if (c != null) {
+                        c.release();
+                    }
+                } catch (Throwable e) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Media",
+                            "decoder " + mime + " FAILED " + e.getClass().getSimpleName()
+                                    + ": " + e.getMessage());
+                }
+            }
+        } catch (Throwable e) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Media",
+                    "codec list FAILED " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * 验证沙箱里 `SurfaceView` 能不能拿到可用 Surface。
+     *
+     * 现状：播放页（漫剧沉浸页）923 个 View 里**一个 SurfaceView / TextureView 都没有**，
+     * 而同一个页面在原生红果里正常出画面。视频 View 建不出来 → 播放器没有 Surface
+     * → 引擎不启动 → 页面永远转圈。所以这里真刀真枪建一个 SurfaceView 挂上去，
+     * 看 `surfaceCreated` 回调会不会来、`getSurface().isValid()` 是否为真。
+     */
+    private static void probeSurfaceView(final Application app) {
+        final Activity act = top.niunaijun.blackbox.app.BActivityThread.sTopActivity;
+        if (act == null) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Surf", "no top activity");
+            return;
+        }
+        final java.util.concurrent.CountDownLatch created =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch changed =
+                new java.util.concurrent.CountDownLatch(1);
+        final String[] info = new String[]{"?"};
+        try {
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.view.SurfaceView sv = new android.view.SurfaceView(act);
+                        sv.getHolder().addCallback(new android.view.SurfaceHolder.Callback() {
+                            @Override
+                            public void surfaceCreated(android.view.SurfaceHolder holder) {
+                                info[0] = "created valid="
+                                        + (holder.getSurface() != null && holder.getSurface().isValid());
+                                created.countDown();
+                            }
+
+                            @Override
+                            public void surfaceChanged(android.view.SurfaceHolder holder, int f,
+                                                       int w, int h) {
+                                changed.countDown();
+                            }
+
+                            @Override
+                            public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+                            }
+                        });
+                        android.view.ViewGroup content =
+                                act.findViewById(android.R.id.content);
+                        if (content == null) {
+                            info[0] = "no content view";
+                            created.countDown();
+                            return;
+                        }
+                        android.widget.FrameLayout.LayoutParams lp =
+                                new android.widget.FrameLayout.LayoutParams(160, 90);
+                        content.addView(sv, lp);
+                        info[0] = "added to " + content.getClass().getSimpleName();
+                    } catch (Throwable t) {
+                        info[0] = "THREW " + t.getClass().getName() + ": " + t.getMessage();
+                        created.countDown();
+                    }
+                }
+            });
+            boolean ok = created.await(4, java.util.concurrent.TimeUnit.SECONDS);
+            boolean c2 = changed.await(2, java.util.concurrent.TimeUnit.SECONDS);
+            top.niunaijun.blackbox.utils.DiagLog.log("Surf",
+                    "addView=" + info[0] + " surfaceCreated=" + ok + " surfaceChanged=" + c2);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Surf",
+                    "probe failed " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    private static String truncate(String s, int n) {
+        return s == null ? "null" : (s.length() <= n ? s : s.substring(0, n) + "…");
+    }
+
+    private static void dumpTopActivityState(Application app) {        Activity a = null;
+        try {
+            a = top.niunaijun.blackbox.app.BActivityThread.sTopActivity;
+        } catch (Throwable ignored) {
+        }
+        if (a == null) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Act", "no top activity");
+            return;
+        }
+        final String name = a.getClass().getName();
+        top.niunaijun.blackbox.utils.DiagLog.log("Act", "=== " + name + " ===");
+        // 1) 实例字段
+        Class<?> c = a.getClass();
+        int depth = 0;
+        while (c != null && depth < 6) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (java.util.regex.Pattern.compile("\\$").matcher(f.getName()).find()) {
+                    continue;
+                }
+                String val;
+                try {
+                    f.setAccessible(true);
+                    val = describeValue(f.get(a));
+                } catch (Throwable t) {
+                    val = "<" + t.getClass().getSimpleName() + ">";
+                }
+                top.niunaijun.blackbox.utils.DiagLog.log("Act",
+                        "  " + f.getType().getSimpleName() + " " + f.getName() + " = " + val);
+            }
+            c = c.getSuperclass();
+            if (c != null && c.getName().startsWith("android.")) {
+                break;
+            }
+            depth++;
+        }
+        // 2) 静态字段：页面数据 S 等
+        try {
+            for (java.lang.reflect.Field f : a.getClass().getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                String val;
+                try {
+                    f.setAccessible(true);
+                    val = describeValue(f.get(null));
+                } catch (Throwable t) {
+                    val = "<" + t.getClass().getSimpleName() + ">";
+                }
+                top.niunaijun.blackbox.utils.DiagLog.log("Act",
+                        "  static " + f.getType().getSimpleName() + " " + f.getName() + " = " + val);
+            }
+        } catch (Throwable ignored) {
+        }
+        // 3) 播放器容器的子树规模（判断是不是还在骨架屏）
+        try {
+            android.view.View decor = a.getWindow() == null ? null : a.getWindow().peekDecorView();
+            if (decor != null) {
+                int[] cnt = new int[]{0};
+                countViews(decor, cnt, 0);
+                top.niunaijun.blackbox.utils.DiagLog.log("Act",
+                        "  decor " + decor.getWidth() + "x" + decor.getHeight()
+                                + " views=" + cnt[0]
+                                + " attached=" + decor.isAttachedToWindow());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void countViews(android.view.View v, int[] cnt, int depth) {
+        if (v == null || depth > 40) {
+            return;
+        }
+        cnt[0]++;
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                countViews(g.getChildAt(i), cnt, depth + 1);
+            }
+        }
+    }
+
+    /** 字段值转成一行可读描述，避免把整个对象 toString 打进日志。 */
+    private static String describeValue(Object v) {
+        if (v == null) {
+            return "null";
+        }
+        if (v instanceof String || v instanceof Number || v instanceof Boolean) {
+            String s = String.valueOf(v);
+            return s.length() > 80 ? s.substring(0, 80) + "…" : s;
+        }
+        if (v instanceof android.view.View) {
+            android.view.View view = (android.view.View) v;
+            String extra = view instanceof android.view.ViewGroup
+                    ? " children=" + ((android.view.ViewGroup) view).getChildCount() : "";
+            return view.getClass().getSimpleName()
+                    + " vis=" + view.getVisibility()
+                    + " " + view.getWidth() + "x" + view.getHeight()
+                    + extra;
+        }
+        return v.getClass().getSimpleName();
     }
 
     private static Object readInstanceField(Object target, String name) {
@@ -2303,6 +2936,15 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         probeFrescoFetch(app);
         dumpNetworkQueues(app);
         dumpViewTree();
+        dumpTopActivityState(app);
+        probeVideoDetailCache(app);
+        probeRxSchedulers(app);
+        probePlainExecutors();
+        probeMediaStack();
+        probeSurfaceView(app);
+        // 修复后再测一遍，直接看 before/after
+        fixRxSchedulers(app);
+        probeRxSchedulers(app);
         probeTtnetSync(app, "https://www.baidu.com/");
         probeTtnetSync(app, sLastDraweeUri);
         logMappedLibs();
@@ -2474,7 +3116,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
 
     private static void walkViews(android.view.View v, int depth,
                                   StringBuilder out, int[] stats, java.util.List<Object> caught) {
-        if (v == null || depth > 30 || stats[0] > 400) {
+        if (v == null || depth > 40 || stats[0] > 2500) {
             return;
         }
         stats[0]++;
