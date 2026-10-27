@@ -1472,11 +1472,119 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         logNetworkState(app);
         probeAppHttp(app);
         logFrescoState(app);
+        probeFrescoFetch(app);
         logMappedLibs();
         logNativeThreads();
         logAllThreads(app);
         exportAppSelfLogs(app);
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump end ===");
+    }
+
+    /**
+     * 决定性实验：用**应用自己的图片管线**去拉一张图。
+     *
+     * 走的是 Fresco 的 `ImagePipeline.fetchDecodedImage`，也就是界面加载封面时走的
+     * 那条完全相同的链路（同样的解码器、缓存、网络 fetcher）。三种结果分别对应：
+     *   - 成功        → 管线没坏，是界面根本没发起请求（问题在上层 UI/数据绑定）
+     *   - 失败 + 原因 → 直接拿到根因（网络 fetcher / 解码器 / 缓存）
+     *   - 8 秒不结束  → 任务进了管线但没人执行（调度层问题）
+     */
+    private static void probeFrescoFetch(final Application app) {
+        if (app == null) {
+            return;
+        }
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String url = "https://www.baidu.com/img/flexible/logo/pc/result.png";
+                Object resultRef = null;
+                try {
+                    ClassLoader cl = app.getClassLoader();
+                    Class<?> fresco = cl.loadClass("com.facebook.drawee.backends.pipeline.Fresco");
+                    Object pipe = fresco.getMethod("getImagePipeline").invoke(null);
+                    Class<?> uriCls = Class.forName("android.net.Uri");
+                    Object uri = uriCls.getMethod("parse", String.class).invoke(null, url);
+                    Class<?> builderCls = cl.loadClass(
+                            "com.facebook.imagepipeline.request.ImageRequestBuilder");
+                    Object builder = builderCls
+                            .getMethod("newBuilderWithSource", uriCls).invoke(null, uri);
+                    Object request = builderCls.getMethod("build").invoke(builder);
+                    Class<?> reqCls = cl.loadClass(
+                            "com.facebook.imagepipeline.request.ImageRequest");
+
+                    java.lang.reflect.Method fetch = null;
+                    for (java.lang.reflect.Method m : pipe.getClass().getMethods()) {
+                        if (!m.getName().equals("fetchDecodedImage")) {
+                            continue;
+                        }
+                        Class<?>[] p = m.getParameterTypes();
+                        if (p.length == 2 && p[0].isAssignableFrom(reqCls)) {
+                            fetch = m;
+                            break;
+                        }
+                    }
+                    if (fetch == null) {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                                "fetchDecodedImage not found");
+                        return;
+                    }
+                    long t0 = System.currentTimeMillis();
+                    Object ds = fetch.invoke(pipe, request, app);
+                    if (ds == null) {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Fresco", "fetch returned null ds");
+                        return;
+                    }
+                    boolean finished = false;
+                    while (System.currentTimeMillis() - t0 < 8000L) {
+                        Object fin = ds.getClass().getMethod("isFinished").invoke(ds);
+                        if (Boolean.TRUE.equals(fin)) {
+                            finished = true;
+                            break;
+                        }
+                        Thread.sleep(100L);
+                    }
+                    long cost = System.currentTimeMillis() - t0;
+                    if (!finished) {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                                "fetch TIMEOUT 8s, still running (任务进了管线没人执行)");
+                        return;
+                    }
+                    Object fail = ds.getClass().getMethod("getFailureCause").invoke(ds);
+                    resultRef = ds.getClass().getMethod("getResult").invoke(ds);
+                    if (fail != null) {
+                        Throwable c = (Throwable) fail;
+                        top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                                "fetch FAIL in " + cost + "ms " + c.getClass().getName()
+                                        + " " + c.getMessage());
+                        StackTraceElement[] st = c.getStackTrace();
+                        StringBuilder sb = new StringBuilder();
+                        for (int i = 0; i < Math.min(12, st.length); i++) {
+                            sb.append("\n      at ").append(st[i]);
+                        }
+                        top.niunaijun.blackbox.utils.DiagLog.log("Fresco", "cause:" + sb);
+                    } else {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                                "fetch OK in " + cost + "ms result="
+                                        + (resultRef == null ? "null"
+                                        : resultRef.getClass().getSimpleName()));
+                    }
+                } catch (Throwable e) {
+                    Throwable c = (e instanceof java.lang.reflect.InvocationTargetException
+                            && e.getCause() != null) ? e.getCause() : e;
+                    top.niunaijun.blackbox.utils.DiagLog.log("Fresco",
+                            "probe err " + c.getClass().getName() + " " + c.getMessage());
+                } finally {
+                    try {
+                        if (resultRef instanceof java.io.Closeable) {
+                            ((java.io.Closeable) resultRef).close();
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }, "adv-fresco-fetch");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
