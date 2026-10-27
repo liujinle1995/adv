@@ -21,6 +21,18 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 82,
+            versionName = "0.9.18",
+            title = "修复：封面/图片加载不出来（接管字节的请求队列）",
+            highlights = listOf(
+                "根因：图片走 FrescoTTNetFetcher → RetrofitUtils → SsHttpExecutor → 字节自己的请求队列（dispatcher）。这个队列在沙箱里「只收不做」——实测 8 个线程全 active、完成数 0、任务堆在队列里，既不建立 socket 也不抛异常，所以界面上永远是空白封面 + 一直转圈",
+                "修复：把这个请求队列换成轻量的 self-hosted 线程池（拿到任务立刻执行）。实测剧场下拉后封面全部正常显示",
+                "顺带证伪了两条旧结论：① HTTP 栈其实早已由应用自己初始化完成，之前那个 m0 \$a 的 ClassNotFoundException 与图片无关；② 链接和 CDN 都正常，同一条 fqnovelpic 链接用应用自己的 TTNet 通道 67ms 就返回了 46904 字节",
+                "新增 TTNet 直连探针、队列探针（线程数/活跃数/队列长度/队首延迟）和线程优先级探针，把「请求卡在哪一层」变成可直接测量的结果",
+                "已知未解决：视频播放仍是黑屏转圈，播放器走的是另一条链路（mdl + 独立 socket），继续排查",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 81,
             versionName = "0.9.17",
             title = "诊断升级：可导出虚拟应用自身日志",

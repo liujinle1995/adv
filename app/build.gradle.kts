@@ -18,8 +18,8 @@ android {
         // 需求：最低支持 Android 12（API 31），最高支持 Android 17（API 37）
         minSdk = 31
         targetSdk = 37
-        versionCode = 81
-        versionName = "0.9.17"
+        versionCode = 82
+        versionName = "0.9.18"
 
         ndk {
             // 目标设备（realme RMX3888 / Android 16）无 32 位运行时

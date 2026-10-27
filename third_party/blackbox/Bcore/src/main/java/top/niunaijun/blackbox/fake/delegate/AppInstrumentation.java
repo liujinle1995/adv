@@ -42,6 +42,8 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      * NewMiraClassloader），否则连应用自己的类都查不到。
      */
     private static volatile Application sTargetApp;
+    /** View 树里最后看到的图片地址，供 TTNet 直连探针复用。 */
+    private static volatile String sLastDraweeUri;
     /** 当前可见的虚拟 Activity，用来遍历它的 View 树做取证。 */
     private static volatile Activity sTopActivity;
 
@@ -965,6 +967,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                     // 顺序很重要：先网络层，再装 HTTP 客户端，再账号/图片/RPC
                     initHttpStack(app);
                     initRpcNow(app);
+                    installRequestQueue(app);
                 }
             }, "adv-boot-init");
             t.setDaemon(true);
@@ -990,50 +993,211 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      * 一旦卡住所有网络请求都会跟着挂，界面就只显示「网络出错」。
      * 所以这里跳过 Cronet，只做前面的必需步骤（公共参数 / TTNetDepend / tryInitTTNet）。
      */
+    /**
+     * `e$b` 的实现类在各版本里混淆名不同：7.1.8.32 是 `p0$a`，7.2.3.65 是 `m0$a`。
+     * 所以这里只把它当候选，真正判据是「谁能被 e$b 赋值」。
+     */
+    private static final String[] HTTP_PROVIDER_CANDIDATES = {
+            "com.dragon.read.app.launch.task.p0$a",
+            "com.dragon.read.app.launch.task.m0$a",
+            "com.dragon.read.app.launch.task.n0$a",
+            "com.dragon.read.app.launch.task.o0$a",
+            "com.dragon.read.app.launch.task.q0$a",
+            "com.dragon.read.app.launch.task.r0$a",
+            "com.dragon.read.app.launch.task.k0$a",
+            "com.dragon.read.app.launch.task.j0$a",
+    };
+
     private static void initHttpStack(Application app) {
+        final Class<?> e;
+        final Class<?> providerBase;
         try {
             ClassLoader cl = app.getClassLoader();
-            Class<?> e = cl.loadClass("com.dragon.read.base.http.e");
-            Class<?> providerBase = cl.loadClass("com.dragon.read.base.http.e$b");
-            Class<?> m0 = cl.loadClass("com.dragon.read.app.launch.task.m0");
-            Class<?> providerCls = cl.loadClass("com.dragon.read.app.launch.task.m0$a");
-            Object outer = m0.getDeclaredConstructor().newInstance();
-            Object provider = null;
+            e = cl.loadClass("com.dragon.read.base.http.e");
+            providerBase = cl.loadClass("com.dragon.read.base.http.e$b");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "http classes missing: " + t.getClass().getSimpleName());
+            return;
+        }
+        ClassLoader cl = app.getClassLoader();
+
+        logHttpState(e, "before");
+
+        // 1) provider：应用自己的启动链可能已经设过，先用现成的。
+        Object provider = getStatic(e, "a");
+        if (provider == null) {
+            Class<?> providerCls = findHttpProvider(cl, providerBase);
+            if (providerCls == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                        "provider NOT FOUND, tried=" + java.util.Arrays.toString(HTTP_PROVIDER_CANDIDATES));
+                return;
+            }
+            provider = newHttpProvider(providerCls, app);
+            if (provider == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                        "provider ctor failed: " + providerCls.getName());
+                return;
+            }
+            setStatic(e, "a", provider);
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "provider = " + providerCls.getName());
+        } else {
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "provider pre-set: " + provider.getClass().getName());
+        }
+
+        // 2) 按 e.d(b) 的原顺序补跑，只跳过最后一步 Cronet。
+        //    每一步单独容错——旧版整段包在一个 try 里，第一行 ClassNotFound
+        //    就把后面所有步骤（包括 tryInitTTNet）全废了。
+        step(e, "f", new Class<?>[0], new Object[0]);
+        step(e, "n", new Class<?>[]{android.content.Context.class}, new Object[]{app});
+        setCronetDepend(cl);
+        step(e, "m", new Class<?>[]{android.content.Context.class, Application.class},
+                new Object[]{app, app});
+        step(e, "l", new Class<?>[0], new Object[0]);
+
+        // 3) d() 结尾会把就绪标志置 true 并回调观察者（这里只置标志，不回调，
+        //    避免应用在 onActivityCreated 之前就跑业务逻辑）。
+        setStatic(e, "b", Boolean.TRUE);
+
+        logHttpState(e, "after");
+    }
+
+    private static Class<?> findHttpProvider(ClassLoader cl, Class<?> base) {
+        for (String name : HTTP_PROVIDER_CANDIDATES) {
             try {
-                java.lang.reflect.Constructor<?> c = providerCls.getDeclaredConstructor(
-                        m0, Application.class);
-                c.setAccessible(true);
-                provider = c.newInstance(outer, app);
+                Class<?> c = Class.forName(name, false, cl);
+                if (!base.isAssignableFrom(c)) {
+                    continue;
+                }
+                if (java.lang.reflect.Modifier.isAbstract(c.getModifiers())) {
+                    continue;
+                }
+                return c;
             } catch (Throwable ignored) {
             }
-            if (provider == null) {
-                java.lang.reflect.Constructor<?> c = providerCls.getDeclaredConstructor(
-                        Application.class);
-                c.setAccessible(true);
-                provider = c.newInstance(app);
+        }
+        return null;
+    }
+
+    /** 内部类形如 `p0$a(p0, Application)`，外层自己 new 一个再传进去。 */
+    private static Object newHttpProvider(Class<?> providerCls, Application app) {
+        Class<?> outerCls = providerCls.getDeclaringClass();
+        if (outerCls == null) {
+            outerCls = providerCls.getEnclosingClass();
+        }
+        Object outer = null;
+        if (outerCls != null) {
+            try {
+                java.lang.reflect.Constructor<?> oc = outerCls.getDeclaredConstructor();
+                oc.setAccessible(true);
+                outer = oc.newInstance();
+            } catch (Throwable ignored) {
             }
+        }
+        if (outer != null) {
+            try {
+                java.lang.reflect.Constructor<?> c =
+                        providerCls.getDeclaredConstructor(outerCls, Application.class);
+                c.setAccessible(true);
+                return c.newInstance(outer, app);
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            java.lang.reflect.Constructor<?> c = providerCls.getDeclaredConstructor(Application.class);
+            c.setAccessible(true);
+            return c.newInstance(app);
+        } catch (Throwable ignored) {
+        }
+        try {
+            java.lang.reflect.Constructor<?> c = providerCls.getDeclaredConstructor();
+            c.setAccessible(true);
+            return c.newInstance();
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
 
-            java.lang.reflect.Field fa = e.getDeclaredField("a");
-            fa.setAccessible(true);
-            fa.set(null, provider);
-
-            e.getMethod("f").invoke(null);
-            e.getMethod("n", android.content.Context.class).invoke(null, app);
-            e.getMethod("m", android.content.Context.class, Application.class).invoke(null, app, app);
-            e.getMethod("l").invoke(null);
-
-            java.lang.reflect.Field fb = e.getDeclaredField("b");
-            fb.setAccessible(true);
-            fb.setBoolean(null, true);
-
-            top.niunaijun.blackbox.utils.DiagLog.log("Http",
-                    "http stack done (cronet skipped)");
+    /** `TTNetInit.setCronetDepend(com.dragon.read.base.http.b.c)`，慢不了也不联网，照样补上。 */
+    private static void setCronetDepend(ClassLoader cl) {
+        try {
+            Class<?> b = cl.loadClass("com.dragon.read.base.http.b");
+            Object depend = b.getField("c").get(null);
+            if (depend == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Http", "step cronetDepend skipped (null)");
+                return;
+            }
+            Class<?> ttnetInit = cl.loadClass("com.bytedance.ttnet.TTNetInit");
+            for (java.lang.reflect.Method m : ttnetInit.getMethods()) {
+                if (!m.getName().equals("setCronetDepend") || m.getParameterCount() != 1) {
+                    continue;
+                }
+                m.setAccessible(true);
+                m.invoke(null, depend);
+                top.niunaijun.blackbox.utils.DiagLog.log("Http", "step cronetDepend ok");
+                return;
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Http", "step cronetDepend: no method");
         } catch (Throwable t) {
-            Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
+            Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
                     && t.getCause() != null) ? t.getCause() : t;
             top.niunaijun.blackbox.utils.DiagLog.log("Http",
-                    "initHttpStack failed: " + cause.getClass().getName() + " " + cause.getMessage());
+                    "step cronetDepend FAIL " + c.getClass().getSimpleName() + ": " + c.getMessage());
         }
+    }
+
+    private static void step(Class<?> cls, String name, Class<?>[] types, Object[] args) {
+        long t0 = System.currentTimeMillis();
+        try {
+            java.lang.reflect.Method m = cls.getDeclaredMethod(name, types);
+            m.setAccessible(true);
+            m.invoke(null, args);
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "step " + name + " ok " + (System.currentTimeMillis() - t0) + "ms");
+        } catch (Throwable t) {
+            Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
+                    && t.getCause() != null) ? t.getCause() : t;
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "step " + name + " FAIL " + c.getClass().getSimpleName() + ": " + c.getMessage());
+        }
+    }
+
+    private static Object getStatic(Class<?> cls, String name) {
+        try {
+            java.lang.reflect.Field f = cls.getDeclaredField(name);
+            f.setAccessible(true);
+            return f.get(null);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static void setStatic(Class<?> cls, String name, Object value) {
+        try {
+            java.lang.reflect.Field f = cls.getDeclaredField(name);
+            f.setAccessible(true);
+            f.set(null, value);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** a=provider / b=就绪标志 / d=TTNetDepend / e=tryInitTTNet 已执行。 */
+    private static void logHttpState(Class<?> e, String tag) {
+        Object a = getStatic(e, "a");
+        Object d = getStatic(e, "d");
+        Object c = getStatic(e, "c");
+        int cbs = -1;
+        if (c instanceof java.util.Collection) {
+            cbs = ((java.util.Collection<?>) c).size();
+        }
+        top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                "e[" + tag + "] provider=" + (a == null ? "null" : a.getClass().getSimpleName())
+                        + " ttnetDepend=" + (d == null ? "null" : "set")
+                        + " ready=" + getStatic(e, "b")
+                        + " ttnetInit=" + getStatic(e, "e")
+                        + " callbacks=" + cbs);
     }
 
     /** RPC 框架是否已完成初始化（`com.bytedance.rpc.m.j()`）。 */
@@ -1469,14 +1633,377 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     }
 
     /** 一次性把关键运行时状态打进日志。 */
+    /**
+     * 找出「请求进去了但没被执行」的那个队列。
+     *
+     * 图片/播放的链路是 FrescoTTNetFetcher → RetrofitUtils → SsHttpExecutor.execute，
+     * 而 SsHttpExecutor 把任务交给 dispatcher.e，dispatcher.e 再转给 dispatcher.d 里的
+     * 5 个线程池；此外 bytex 的 taskmonitor 还会把带节流标注的任务改派到
+     * ThrottleExecutors 的 ScheduledExecutorService（延迟队列）。
+     *
+     * 任何一层堵住，现象都是「没有 socket、没有异常、线程全空闲」，
+     * 所以必须逐个看队列长度和队首延迟，否则永远猜不到。
+     */
+    private static void dumpNetworkQueues(Application app) {
+        ClassLoader cl = app.getClassLoader();
+        try {
+            Class<?> sse = cl.loadClass(
+                    "com.bytedance.frameworks.baselib.network.http.retrofit.SsHttpExecutor");
+            java.lang.reflect.Field f = sse.getDeclaredField("sRequestQueue");
+            f.setAccessible(true);
+            Object q = f.get(null);
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                    "SsHttpExecutor.sRequestQueue=" + (q == null ? "null" : q.getClass().getName()));
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                    "SsHttpExecutor failed: " + t.getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> d = cl.loadClass("com.bytedance.frameworks.baselib.network.dispatcher.d");
+            java.lang.reflect.Field hf = d.getDeclaredField("h");
+            hf.setAccessible(true);
+            dumpPoolFields(d, hf.get(null), "dispatcher.d");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                    "dispatcher.d failed: " + t.getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> te = cl.loadClass("com.ss.android.ugc.bytex.taskmonitor.ThrottleExecutors");
+            dumpPoolFields(te, null, "ThrottleExecutors");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                    "ThrottleExecutors failed: " + t.getClass().getSimpleName());
+        }
+
+        try {
+            Class<?> tm = cl.loadClass("com.ss.android.ugc.bytex.taskmonitor.TaskMonitor");
+            Object r = tm.getMethod("isEnableThrottle").invoke(null);
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue", "TaskMonitor.isEnableThrottle=" + r);
+            dumpPoolFields(tm, null, "TaskMonitor");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                    "TaskMonitor failed: " + t.getClass().getSimpleName());
+        }
+
+        // 池里说 size=8 active=8，线程转储里却找不到 Net*，两者必须能对上
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (java.util.Map.Entry<Thread, StackTraceElement[]> en
+                    : Thread.getAllStackTraces().entrySet()) {
+                String n = en.getKey().getName();
+                if (n == null || !n.startsWith("Net")) {
+                    continue;
+                }
+                sb.append(n).append('=').append(en.getKey().getState()).append(' ');
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue", "NetThreads " + sb);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void dumpPoolFields(Class<?> cls, Object target, String label) {
+        java.lang.reflect.Field[] fs;
+        try {
+            fs = cls.getDeclaredFields();
+        } catch (Throwable t) {
+            return;
+        }
+        for (java.lang.reflect.Field f : fs) {
+            if (!java.util.concurrent.Executor.class.isAssignableFrom(f.getType())) {
+                continue;
+            }
+            Object v;
+            try {
+                f.setAccessible(true);
+                v = f.get(java.lang.reflect.Modifier.isStatic(f.getModifiers()) ? null : target);
+            } catch (Throwable t) {
+                continue;
+            }
+            if (v == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                        label + "." + f.getName() + "=null");
+                continue;
+            }
+            logPool(label + "." + f.getName(), v);
+        }
+    }
+
+    private static void logPool(String name, Object v) {
+        if (!(v instanceof java.util.concurrent.ThreadPoolExecutor)) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                    name + "=" + v.getClass().getSimpleName());
+            return;
+        }
+        java.util.concurrent.ThreadPoolExecutor p = (java.util.concurrent.ThreadPoolExecutor) v;
+        int queued = -1;
+        long headDelay = -1L;
+        try {
+            java.util.concurrent.BlockingQueue<Runnable> bq = p.getQueue();
+            queued = bq.size();
+            // 走接口反射：实现类往往是 private 内部类，直接 getMethod 会拿不到
+            Object head = java.util.concurrent.BlockingQueue.class.getMethod("peek").invoke(bq);
+            if (head != null) {
+                Object d = java.util.concurrent.Delayed.class
+                        .getMethod("getDelay", java.util.concurrent.TimeUnit.class)
+                        .invoke(head, java.util.concurrent.TimeUnit.MILLISECONDS);
+                if (d instanceof Number) {
+                    headDelay = ((Number) d).longValue();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        top.niunaijun.blackbox.utils.DiagLog.log("Queue",
+                name + " size=" + p.getPoolSize() + " active=" + p.getActiveCount()
+                        + " queued=" + queued + " headDelayMs=" + headDelay
+                        + " done=" + p.getCompletedTaskCount() + " shutdown=" + p.isShutdown());
+    }
+
+    /**
+     * 用应用自己的 TTNet 通道（TTNetDepend.executeGet）发一次同步 GET。
+     *
+     * 这是绕开 Fresco、绕开 Retrofit 的最小复现：
+     * - 能返回 -> TTNet 本身没问题，卡点在 Fresco/Retrofit 那一层；
+     * - 一直不返回 -> TTNet 底层不通，再看具体是哪个域名。
+     */
+    /**
+     * 接管字节的请求队列。
+     *
+     * 链路：FrescoTTNetFetcher → RetrofitUtils.createSsService → SsCall.enqueue
+     *      → SsHttpExecutor.execute → sRequestQueue.b(task)
+     * 实测沙箱里 sRequestQueue 指向的 dispatcher 池「8 个线程全 active、完成数 0」，
+     * 任务进去就再也不出来（队列里堆着，既不建 socket 也不报错）。
+     *
+     * 所以把 sRequestQueue 换成一个只做一件事的队列：拿到 task 立刻丢到普通线程池执行。
+     * 丢失的是优先级排序和延迟调度，换来的是请求真的能发出去。
+     *
+     * sRequestQueue 的声明类型是接口 jb0.a，所以可以用 Proxy 顶上。
+     */
+    private static void installRequestQueue(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            // 注意：接口的真实类名就是顶层包 jb0.a（之前误加了 dispatcher 前缀，导致 CNFE）
+            Class<?> queueItf = cl.loadClass("jb0.a");
+            Class<?> sse = cl.loadClass(
+                    "com.bytedance.frameworks.baselib.network.http.retrofit.SsHttpExecutor");
+            java.lang.reflect.Field f = sse.getDeclaredField("sRequestQueue");
+            f.setAccessible(true);
+            Object cur = f.get(null);
+            if (cur != null && cur.getClass().getName().contains("$Proxy")) {
+                return;
+            }
+            Object proxy = java.lang.reflect.Proxy.newProxyInstance(
+                    cl, new Class<?>[]{queueItf}, new RequestQueueHandler());
+            f.set(null, proxy);
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "request queue -> adv-net (was "
+                            + (cur == null ? "null" : cur.getClass().getSimpleName()) + ")");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "installRequestQueue failed: " + t.getClass().getSimpleName()
+                            + " " + t.getMessage());
+            replaceDispatcherPools(app);
+        }
+    }
+
+    /**
+     * 兜底：把 dispatcher.d 里那 5 个「收任务不干活」的池换成普通线程池。
+     * 实测它们 size=8 active=8 done=0，队列里有任务但永远不完成。
+     */
+    private static void replaceDispatcherPools(Application app) {
+        try {
+            ClassLoader cl = app.getClassLoader();
+            Class<?> dCls = cl.loadClass("com.bytedance.frameworks.baselib.network.dispatcher.d");
+            java.lang.reflect.Field hf = dCls.getDeclaredField("h");
+            hf.setAccessible(true);
+            Object d = hf.get(null);
+            if (d == null) {
+                top.niunaijun.blackbox.utils.DiagLog.log("Http", "dispatcher.d.h is null");
+                return;
+            }
+            int n = 0;
+            for (java.lang.reflect.Field f : dCls.getDeclaredFields()) {
+                if (f.getType() != java.util.concurrent.ThreadPoolExecutor.class) {
+                    continue;
+                }
+                f.setAccessible(true);
+                java.util.concurrent.ThreadPoolExecutor pool =
+                        new java.util.concurrent.ThreadPoolExecutor(
+                                2, 8, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                                new java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+                                new java.util.concurrent.ThreadFactory() {
+                                    private final java.util.concurrent.atomic.AtomicInteger seq =
+                                            new java.util.concurrent.atomic.AtomicInteger(1);
+
+                                    @Override
+                                    public Thread newThread(Runnable r) {
+                                        Thread t = new Thread(r, "adv-disp-" + seq.getAndIncrement());
+                                        t.setDaemon(true);
+                                        return t;
+                                    }
+                                });
+                pool.allowCoreThreadTimeOut(true);
+                f.set(d, pool);
+                n++;
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Http", "dispatcher pools replaced: " + n);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Http",
+                    "replaceDispatcherPools failed: " + t.getClass().getSimpleName()
+                            + " " + t.getMessage());
+        }
+    }
+
+    private static final class RequestQueueHandler implements java.lang.reflect.InvocationHandler {
+        static final java.util.concurrent.ExecutorService POOL =
+                java.util.concurrent.Executors.newCachedThreadPool(
+                        new java.util.concurrent.ThreadFactory() {
+                            private final java.util.concurrent.atomic.AtomicInteger seq =
+                                    new java.util.concurrent.atomic.AtomicInteger(1);
+
+                            @Override
+                            public Thread newThread(Runnable r) {
+                                Thread t = new Thread(r, "adv-net-" + seq.getAndIncrement());
+                                t.setDaemon(true);
+                                return t;
+                            }
+                        });
+
+        @Override
+        public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
+            String name = method.getName();
+            if ("toString".equals(name)) {
+                return "adv-net-queue";
+            }
+            if ("hashCode".equals(name)) {
+                return System.identityHashCode(proxy);
+            }
+            if ("equals".equals(name)) {
+                return args != null && args.length == 1 && proxy == args[0];
+            }
+            if (args != null) {
+                for (Object a : args) {
+                    if (a instanceof Runnable) {
+                        POOL.execute((Runnable) a);
+                        break;
+                    }
+                }
+            }
+            return null;
+        }
+    }
+
+    /** dispatcher 的线程一启动就调 setThreadPriority(10)，确认它在沙箱里不会卡住。 */
+    private static void probeThreadPriority() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                long t0 = System.currentTimeMillis();
+                try {
+                    android.os.Process.setThreadPriority(10);
+                    top.niunaijun.blackbox.utils.DiagLog.log("Prio",
+                            "setThreadPriority(10) ok " + (System.currentTimeMillis() - t0) + "ms");
+                } catch (Throwable e) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("Prio",
+                            "setThreadPriority(10) FAIL " + e.getClass().getSimpleName()
+                                    + ": " + e.getMessage());
+                }
+            }
+        }, "adv-prio-probe");
+        t.setDaemon(true);
+        t.start();
+        try {
+            t.join(3000L);
+        } catch (InterruptedException ignored) {
+        }
+        if (t.isAlive()) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Prio",
+                    "setThreadPriority(10) STILL BLOCKED after 3s");
+        }
+    }
+
+    private static void probeTtnetSync(final Application app, final String url) {
+        if (url == null || url.length() == 0) {
+            return;
+        }
+        final Object depend;
+        try {
+            Class<?> e = app.getClassLoader().loadClass("com.dragon.read.base.http.e");
+            depend = getStatic(e, "d");
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Ttnet",
+                    "skip " + url + ": " + t.getClass().getSimpleName());
+            return;
+        }
+        if (depend == null) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Ttnet", "skip " + url + ": no TTNetDepend");
+            return;
+        }
+        final String shortUrl = url.length() > 60 ? url.substring(0, 60) : url;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                long t0 = System.currentTimeMillis();
+                try {
+                    Object r = null;
+                    boolean called = false;
+                    for (java.lang.reflect.Method m : depend.getClass().getMethods()) {
+                        if (!m.getName().equals("executeGet") || m.getParameterCount() != 2) {
+                            continue;
+                        }
+                        if (m.getParameterTypes()[1] != String.class) {
+                            continue;
+                        }
+                        m.setAccessible(true);
+                        r = m.invoke(depend, 0, url);
+                        called = true;
+                        break;
+                    }
+                    if (!called) {
+                        top.niunaijun.blackbox.utils.DiagLog.log("Ttnet",
+                                "no executeGet(int,String) on " + depend.getClass().getName());
+                        return;
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("Ttnet",
+                            "GET " + shortUrl + " -> "
+                                    + (r instanceof String ? "len=" + ((String) r).length() : String.valueOf(r))
+                                    + " in " + (System.currentTimeMillis() - t0) + "ms");
+                } catch (Throwable th) {
+                    Throwable c = (th instanceof java.lang.reflect.InvocationTargetException
+                            && th.getCause() != null) ? th.getCause() : th;
+                    top.niunaijun.blackbox.utils.DiagLog.log("Ttnet",
+                            "GET " + shortUrl + " FAIL " + c.getClass().getSimpleName()
+                                    + ": " + c.getMessage()
+                                    + " in " + (System.currentTimeMillis() - t0) + "ms");
+                }
+            }
+        }, "adv-ttnet-probe");
+        t.setDaemon(true);
+        t.start();
+        try {
+            t.join(8000L);
+        } catch (InterruptedException ignored) {
+        }
+        if (t.isAlive()) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Ttnet",
+                    "GET " + shortUrl + " STILL BLOCKED after 8s");
+        }
+    }
+
     private static void dumpDiagnostics(Application app, String reason) {
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump begin (" + reason + ") ===");
+        installRequestQueue(app);
+        probeThreadPriority();
         logExecutorState(app);
         logNetworkState(app);
         probeAppHttp(app);
         logFrescoState(app);
         probeFrescoFetch(app);
+        dumpNetworkQueues(app);
         dumpViewTree();
+        probeTtnetSync(app, "https://www.baidu.com/");
+        probeTtnetSync(app, sLastDraweeUri);
         logMappedLibs();
         logNativeThreads();
         logAllThreads(app);
@@ -1659,6 +2186,7 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                             if (u != null) {
                                 uri = String.valueOf(u);
                                 stats[2]++;
+                                sLastDraweeUri = uri;
                                 if (caught.size() < 3 && v.isShown()) {
                                     caught.add(req);
                                 }
