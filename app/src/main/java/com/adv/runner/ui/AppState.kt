@@ -1284,9 +1284,31 @@ class AppState(
             val base = File(boxRoot, sub)
             base.listFiles()?.forEach { userDir ->
                 val target = File(userDir, pkg)
-                if (target.exists() && target.deleteRecursively()) {
-                    removed++
+                if (!target.exists()) return@forEach
+
+                // 保留 shared_prefs —— 字节系的 device_id / install_id / openudid
+                // 以及 Keva 的键值都存在这里，它们是「设备已注册」的凭据。
+                // 一旦删掉，应用下次启动必须重新注册设备；而沙箱环境过不了服务端风控，
+                // 重新注册会持续失败，表现为主界面「网络出错，请点击重试」，
+                // 点重试也恢复不了（真机实测：清数据后连续 3 次重启全部失败，
+                // 而清数据前一切正常；client_key 在两种情况下都是空，故与它无关）。
+                // 因此这里只清业务数据（databases / files / cache），保住设备身份。
+                val prefs = File(target, "shared_prefs")
+                val prefsBak = File(userDir, "$pkg.__prefs_bak")
+                var backed = false
+                if (prefs.isDirectory) {
+                    prefsBak.deleteRecursively()
+                    backed = prefs.renameTo(prefsBak)
                 }
+
+                if (target.deleteRecursively()) removed++
+
+                if (backed) {
+                    if (target.mkdirs()) {
+                        prefsBak.renameTo(File(target, "shared_prefs"))
+                    }
+                }
+                prefsBak.deleteRecursively()
             }
         }
         return removed

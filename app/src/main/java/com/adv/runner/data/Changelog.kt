@@ -21,6 +21,15 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 74,
+            versionName = "0.9.10",
+            title = "清空数据保留设备身份，避免清完就永久断网",
+            highlights = listOf(
+                "清空数据会连设备注册凭据一起删掉，应用重新注册时被服务端风控拒绝，主界面会永久显示「网络出错」且点重试无效",
+                "现在清空数据只清业务数据（数据库/文件/缓存），保留设备标识（shared_prefs），清完仍能正常联网",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 73,
             versionName = "0.9.9",
             title = "修重启卡死、启动页兜底提速、清数据后不再自己退出",
