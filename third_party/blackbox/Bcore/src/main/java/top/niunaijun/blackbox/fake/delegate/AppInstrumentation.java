@@ -1740,11 +1740,28 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         }
         diagPollerStarted = true;
         final Application hostApp = app;
+        // 触发基线必须以「启动瞬间的 mtime」为准。
+        // 原来从 0 开始，于是每个进程一启动就自触发一次完整 dump；
+        // 主进程那次 dump 会卡在需要主线程配合的探针上（dumpViewTree 等），
+        // 结果主进程的 poller 永久卡死、后续写入触发文件完全没反应
+        // （实测：子进程 4 个都 dump 了，主进程一声不响）。
+        long baseline = 0L;
+        try {
+            java.io.File base = top.niunaijun.blackbox.utils.DiagLog.externalFilesDir();
+            if (base != null) {
+                java.io.File f = new java.io.File(new java.io.File(base, ".diag"), "dump");
+                if (f.exists()) {
+                    baseline = f.lastModified();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        final long startMtime = baseline;
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
                 java.io.File trigger = null;
-                long lastMtime = 0L;
+                long lastMtime = startMtime;
                 for (int i = 0; i < 7200; i++) {
                     try {
                         if (trigger == null) {
@@ -1774,6 +1791,166 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         t.setDaemon(true);
         t.start();
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "poller started");
+        startDataExportPoller(hostApp);
+    }
+
+    /**
+     * 独立的「只导数据」轮询线程，触发文件 `.diag/getdata`。
+     *
+     * 为什么不复用上面那个：完整 dump 里有一批探针要等主线程回包，
+     * 主线程一忙就卡住，连带整个 poller 失效。排查「应用内某个功能不工作」
+     * 时真正需要的往往只是应用自己写的日志，这件事很轻、不会卡，
+     * 所以单独一条线程、单独一个触发文件，互不影响。
+     */
+    private static void startDataExportPoller(final Application hostApp) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                java.io.File trigger = null;
+                java.io.File netTrigger = null;
+                long last = 0L;
+                boolean inited = false;
+                long lastNet = 0L;
+                boolean netInited = false;
+                for (int i = 0; i < 7200; i++) {
+                    try {
+                        if (trigger == null) {
+                            java.io.File base =
+                                    top.niunaijun.blackbox.utils.DiagLog.externalFilesDir();
+                            if (base == null) {
+                                Thread.sleep(1000L);
+                                continue;
+                            }
+                            java.io.File diag = new java.io.File(base, ".diag");
+                            trigger = new java.io.File(diag, "getdata");
+                            netTrigger = new java.io.File(diag, "netprobe");
+                        }
+                        if (trigger.exists()) {
+                            long mtime = trigger.lastModified();
+                            if (!inited) {
+                                inited = true;
+                                last = mtime;
+                            } else if (mtime != last) {
+                                last = mtime;
+                                Application target = sTargetApp != null ? sTargetApp : hostApp;
+                                exportGuestData(target);
+                            }
+                        }
+                        // 触发文件内容就是要访问的 URL：用来判断「沙箱进程自己能不能
+                        // 访问某个地址」，这是把网络问题和应用逻辑问题分开的最快办法。
+                        if (netTrigger != null && netTrigger.exists()) {
+                            long mtime = netTrigger.lastModified();
+                            if (!netInited) {
+                                netInited = true;
+                                lastNet = mtime;
+                            } else if (mtime != lastNet) {
+                                lastNet = mtime;
+                                probeHttpsInGuest(readFirstLine(netTrigger));
+                            }
+                        }
+                        Thread.sleep(800L);
+                    } catch (InterruptedException e) {
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }, "adv-data-poll");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static String readFirstLine(java.io.File f) {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+            try {
+                String line = r.readLine();
+                return line == null ? "" : line.trim();
+            } finally {
+                r.close();
+            }
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /**
+     * 在**当前虚拟进程**里发一次 HTTPS GET，结果写进诊断日志。
+     *
+     * 用途：把「网络不通」和「应用自己的逻辑坏了」分开。
+     * 外部 shell（adb/curl）跑在 shell uid 下，走的是另一个网络身份，
+     * 它通不代表应用进程里通 —— 反过来也一样。
+     */
+    private static void probeHttpsInGuest(String url) {
+        if (url == null || url.length() == 0) {
+            return;
+        }
+        final String target = url;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                long t0 = android.os.SystemClock.elapsedRealtime();
+                java.net.HttpURLConnection c = null;
+                try {
+                    c = (java.net.HttpURLConnection) new java.net.URL(target).openConnection();
+                    c.setConnectTimeout(10000);
+                    c.setReadTimeout(10000);
+                    c.setRequestProperty("User-Agent",
+                            "Mozilla/5.0 BiliDroid/9.16.1 (bbcallen@gmail.com) os/android "
+                                    + "model/YLP-W00 mobi_app/android build/9161110");
+                    c.setRequestProperty("Referer", "https://www.bilibili.com");
+                    c.setRequestProperty("Range", "bytes=0-8191");
+                    int code = c.getResponseCode();
+                    java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                    int total = 0;
+                    String head = "";
+                    if (in != null) {
+                        byte[] buf = new byte[4096];
+                        int n;
+                        java.io.ByteArrayOutputStream headBuf = new java.io.ByteArrayOutputStream();
+                        while ((n = in.read(buf)) > 0) {
+                            total += n;
+                            if (headBuf.size() < 200) {
+                                headBuf.write(buf, 0, Math.min(n, 200 - headBuf.size()));
+                            }
+                            if (total >= 65536) {
+                                break;
+                            }
+                        }
+                        in.close();
+                        head = new String(headBuf.toByteArray(), "UTF-8")
+                                .replace('\n', '|').replace('\r', ' ');
+                    }
+                    top.niunaijun.blackbox.utils.DiagLog.log("NetProbe",
+                            "code=" + code + " bytes=" + total + " ms="
+                                    + (android.os.SystemClock.elapsedRealtime() - t0)
+                                    + " len=" + (c.getContentLengthLong())
+                                    + " url=" + shortProbeUrl(target) + " head=" + head);
+                } catch (Throwable e) {
+                    top.niunaijun.blackbox.utils.DiagLog.log("NetProbe",
+                            "FAILED " + e.getClass().getSimpleName() + ": " + e.getMessage()
+                                    + " ms=" + (android.os.SystemClock.elapsedRealtime() - t0)
+                                    + " url=" + shortProbeUrl(target));
+                } finally {
+                    if (c != null) {
+                        c.disconnect();
+                    }
+                }
+            }
+        }, "adv-netprobe");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static String shortProbeUrl(String url) {
+        try {
+            java.net.URL u = new java.net.URL(url);
+            String s = u.getHost() + u.getPath();
+            return s.length() > 90 ? s.substring(0, 90) + "..." : s;
+        } catch (Throwable t) {
+            return url.length() > 90 ? url.substring(0, 90) : url;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -3671,6 +3848,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         logNativeThreads();
         logAllThreads(app);
         exportAppSelfLogs(app);
+        // 虚拟应用自己的数据目录（含应用自己写的日志）一起导出来：
+        // 应用的问题基本都记在它自己的日志里，而宿主/外部分别没有权限读。
+        exportGuestData(app);
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump end ===");
     }
 
@@ -4385,6 +4565,54 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         }, "adv-http-probe");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * 把**当前虚拟应用**的数据目录导到外部可读目录。
+     *
+     * 与 [exportAppSelfLogs] 的区别：那个只搬 `files/` 下的小文本文件；
+     * 这个按应用自己约定的布局搬，覆盖哔哩哔哩这种把日志写在 `app_blog_v3`
+     * 而不是 `files` 的应用。目录名带 pid，避免多个进程互相覆盖。
+     *
+     * 只搬文本类目录（files / app_blog_v3 / shared_prefs），跳过 cache、lib、
+     * oat、databases，总量上限 12 MB。
+     */
+    private static void exportGuestData(Application app) {
+        try {
+            if (app == null || "com.adv.runner.AdvApp".equals(app.getClass().getName())) {
+                return;
+            }
+            java.io.File dataDir = app.getFilesDir() == null
+                    ? null : app.getFilesDir().getParentFile();
+            // 必须用「已验证可写」的基准目录：虚拟进程里 Environment 的路径是重定向过的
+            java.io.File base = top.niunaijun.blackbox.utils.DiagLog.writableBaseDir();
+            if (dataDir == null || base == null) {
+                return;
+            }
+            java.io.File outDir = new java.io.File(new java.io.File(base, ".diag"),
+                    "appdata-" + android.os.Process.myPid());
+            long[] budget = {12L * 1024 * 1024};
+            int[] count = {0};
+            String[] dirs = {"files", "app_blog_v3", "shared_prefs"};
+            StringBuilder moved = new StringBuilder();
+            for (String name : dirs) {
+                java.io.File src = new java.io.File(dataDir, name);
+                if (!src.isDirectory()) {
+                    continue;
+                }
+                int before = count[0];
+                copyTree(src, new java.io.File(outDir, name), budget, count, 0);
+                if (count[0] > before) {
+                    moved.append(name).append('(').append(count[0] - before).append("),");
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Export2",
+                    "pkg=" + app.getPackageName() + " moved=" + moved
+                            + " left=" + (budget[0] / 1024) + "KB out=" + outDir.getAbsolutePath());
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Export2",
+                    "failed " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
     }
 
     /**

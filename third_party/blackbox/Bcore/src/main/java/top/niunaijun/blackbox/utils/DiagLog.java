@@ -106,6 +106,30 @@ public final class DiagLog {
         }
     }
 
+    /**
+     * 当前进程**已验证可写**的基准目录（日志目录的上一级，通常就是 `.../files`）。
+     *
+     * 为什么不用 [externalFilesDir]：虚拟应用进程里 `Environment.getExternalStorageDirectory()`
+     * 会被沙箱按虚拟包重定向，拼出来的 `/Android/data/<虚拟包>/files` 与宿主实际目录不是一回事，
+     * 写进去外部根本找不到（实测导出 51 个文件"成功"，磁盘上却一个都没有）。
+     * 而 [pickDir] 是逐个候选真写探测出来的，它所在的位置一定有权限。
+     */
+    public static File writableBaseDir() {
+        try {
+            File dir = sLogDir;
+            if (dir == null) {
+                dir = pickDir();
+                if (dir == null) {
+                    return null;
+                }
+                sLogDir = dir;
+            }
+            return dir.getParentFile();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private static String hostPkg() {
         try {
             String pkg = BlackBoxCore.getHostPkg();
