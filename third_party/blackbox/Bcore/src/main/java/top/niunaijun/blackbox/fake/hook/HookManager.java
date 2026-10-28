@@ -1,5 +1,6 @@
 package top.niunaijun.blackbox.fake.hook;
 
+import android.os.Build;
 import android.util.Log;
 
 import java.util.HashMap;
@@ -26,6 +27,7 @@ import top.niunaijun.blackbox.fake.service.IFingerprintManagerProxy;
 import top.niunaijun.blackbox.fake.service.IGraphicsStatsProxy;
 import top.niunaijun.blackbox.fake.service.IJobServiceProxy;
 import top.niunaijun.blackbox.fake.service.ILauncherAppsProxy;
+import top.niunaijun.blackbox.fake.service.ILocaleManagerProxy;
 import top.niunaijun.blackbox.fake.service.ILocationManagerProxy;
 import top.niunaijun.blackbox.fake.service.IMediaRouterServiceProxy;
 import top.niunaijun.blackbox.fake.service.IMediaSessionManagerProxy;
@@ -116,6 +118,17 @@ public class HookManager {
             if (BuildCompat.isS()) {
                 addInjector(new IActivityClientProxy(null));
                 addInjector(new IVpnManagerProxy());
+            }
+            // 13.0（locale 服务只在这里才有）：不拦的话，虚拟包调
+            // LocaleManager.setApplicationLocales() 会被系统以
+            // "Unknown package: xxx for user 0" 拒绝，哔哩哔哩这类
+            // 在 <clinit> 里调用的应用会直接闪退。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    addInjector(new ILocaleManagerProxy());
+                } catch (Throwable t) {
+                    Log.w(TAG, "ILocaleManagerProxy init failed: " + t);
+                }
             }
             // 11.0
             if (BuildCompat.isR()) {

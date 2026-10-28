@@ -21,6 +21,18 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 93,
+            versionName = "0.9.29",
+            title = "修复哔哩哔哩启动即闪退：补齐 locale 系统服务代理",
+            highlights = listOf(
+                "根因：哔哩哔哩在 kntr.base.localization.Localization 的静态初始化里调用 LocaleManager.setApplicationLocales()，系统侧按包名校验，虚拟包在真实 PackageManager 里查不到，抛 IllegalArgumentException: Unknown package: tv.danmaku.bili for user 0；异常升级为 ExceptionInInitializerError → NoClassDefFoundError，进程启动后几百毫秒即崩溃",
+                "新增 ILocaleManagerProxy（API 33+）：拦截 setApplicationLocales / getApplicationLocales / setOverrideLocaleConfig / getOverrideLocaleConfig，per-app 语言只在沙箱内记录、不落到系统侧；getSystemLocales 等其余方法转发真实服务，系统语言照常共用",
+                "这个问题不只影响哔哩哔哩：任何调用 LocaleManager 按包名操作的应用在沙箱里都会崩，代理是通用修复",
+                "顺带补上崩溃可见性：应用自己装的崩溃处理器（如哔哩哔哩 blcrash）上报完不抛异常，进程静默消失、dropbox 无记录；现在会在应用 onCreate 之后套一层，先把堆栈写进诊断日志",
+                "debug_reset 的「清安全模式」从只支持红果扩展为通用：清理前先记录应用数据目录快照，再按名字删掉崩溃记录/安全模式状态（不动业务数据与设备身份）"
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 92,
             versionName = "0.9.28",
             title = "可靠性与可测性：不再把失败伪装成空列表，补齐状态机/迁移/兼容矩阵测试",

@@ -905,6 +905,10 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             throw t;
         }
         top.niunaijun.blackbox.utils.DiagLog.log("Inst", "application onCreate RETURNED");
+        // 应用自己的 onCreate 里通常已经装过自己的 UncaughtExceptionHandler
+        // （哔哩哔哩装的是 com.bilibili.lib.blcrash.k）。它们上报完不 rethrow，
+        // 进程静默消失、dropbox 无记录。这里包一层，先落一份堆栈再交给它。
+        wrapUncaughtHandler();
         // 应用自己的初始化可能又装了一遍 RxJavaPlugins，这里再压一次，确保
         // 后续所有 Schedulers.io() 都用我们可用的线程池
         fixRxSchedulers(app);
@@ -1459,6 +1463,45 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         return null;
     }
 
+    /** 我们自己那层 UEH 包装器；用于避免重复包装。 */
+    private static Thread.UncaughtExceptionHandler sAdvUeh;
+
+    /**
+     * 给「应用自己装的崩溃处理器」套一层日志。
+     *
+     * 哔哩哔哩的 blcrash 捕获异常后只上报、不 rethrow，进程就此消失：
+     * dropbox 没有 data_app_crash、也没有 native crash，ROM 又把 logcat 关了，
+     * 外部完全看不出发生了什么。包一层之后堆栈会先落到诊断日志里。
+     */
+    private static void wrapUncaughtHandler() {
+        try {
+            final Thread.UncaughtExceptionHandler prev =
+                    Thread.getDefaultUncaughtExceptionHandler();
+            if (prev == null || prev == sAdvUeh) {
+                return;
+            }
+            // 已经是引擎自己那层（会记录日志），不必再包
+            if (prev.getClass().getName().startsWith(
+                    "top.niunaijun.blackbox.core.CrashHandler")) {
+                return;
+            }
+            sAdvUeh = new Thread.UncaughtExceptionHandler() {
+                @Override
+                public void uncaughtException(Thread t, Throwable e) {
+                    try {
+                        top.niunaijun.blackbox.core.CrashHandler.logThrowable(t, e);
+                    } catch (Throwable ignored) {
+                    }
+                    prev.uncaughtException(t, e);
+                }
+            };
+            Thread.setDefaultUncaughtExceptionHandler(sAdvUeh);
+            top.niunaijun.blackbox.utils.DiagLog.log("Crash",
+                    "UEH wrapped: " + prev.getClass().getName());
+        } catch (Throwable ignored) {
+        }
+    }
+
     /**
      * 按宿主要求清除目标应用的「连续崩溃计数」（安全模式计数）。
      *
@@ -1468,28 +1511,117 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      * 背景：红果把「启动即被杀」也算作异常启动，累计到阈值后，
      * Application 会走 SafeMode 分支等待一个不会完成的任务，形成
      * 「卡死 → 被杀 → 计数+1 → 更卡」的死循环，只能从 App 内部清计数来打破。
+     * 哔哩哔哩同理，但它不返回任何异常，而是直接拉起
+     * `com.bilibili.app.safemode.SafeModeActivity` 并杀掉主进程。
      */
     private static void clearSafeModeIfRequested(Application app) {
         try {
             String pkg = app.getPackageName();
-            if (pkg == null || !pkg.startsWith("com.phoenix.read")) return;
+            if (pkg == null) return;
             java.io.File dataDir = app.getFilesDir() == null ? null : app.getFilesDir().getParentFile();
             if (dataDir == null) return;
             java.io.File flag = new java.io.File(dataDir, ".adv_flags/clear_safemode");
             if (!flag.isFile()) return;
 
-            ClassLoader cl = app.getClassLoader();
-            if (cl == null) cl = ClassLoader.getSystemClassLoader();
-            Class<?> c = cl.loadClass("com.dragon.read.app.h1");
-            Object inst = c.getMethod("f").invoke(null);
-            java.lang.reflect.Method reset = c.getMethod("s", boolean.class, String.class);
-            reset.invoke(inst, false, "adv_reset");
+            // 清之前先把现场记下来：一旦删掉就再也看不到它判定的依据是什么
+            dumpAppDataDigest(dataDir, "before-clear");
+
+            if (pkg.startsWith("com.phoenix.read")) {
+                // 字节系有现成的 API，优先走它，避免漏掉内存里的计数
+                ClassLoader cl = app.getClassLoader();
+                if (cl == null) cl = ClassLoader.getSystemClassLoader();
+                Class<?> c = cl.loadClass("com.dragon.read.app.h1");
+                Object inst = c.getMethod("f").invoke(null);
+                java.lang.reflect.Method reset = c.getMethod("s", boolean.class, String.class);
+                reset.invoke(inst, false, "adv_reset");
+            }
+
+            // 通用兜底：删掉「崩溃记录 / 安全模式」这类持久化状态。
+            // 只按名字匹配，不碰业务数据（databases / shared_prefs / files 里的其它内容）。
+            int removed = 0;
+            StringBuilder names = new StringBuilder();
+            java.io.File[] children = dataDir.listFiles();
+            if (children != null) {
+                for (java.io.File f : children) {
+                    String n = f.getName();
+                    if (isSafeModeArtifact(n)) {
+                        deleteRecursively(f);
+                        removed++;
+                        if (names.length() < 160) names.append(n).append(',');
+                    }
+                }
+            }
             boolean deleted = flag.delete();
             top.niunaijun.blackbox.utils.DiagLog.log("Safe",
-                    "clearSafeMode OK, flagDeleted=" + deleted);
+                    "clearSafeMode pkg=" + pkg + " removed=" + removed
+                            + " names=" + names + " flagDeleted=" + deleted);
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Safe",
                     "clearSafeMode failed: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /** 名字像「崩溃记录 / 安全模式」的顶层条目。 */
+    private static boolean isSafeModeArtifact(String name) {
+        if (name == null) return false;
+        String n = name.toLowerCase(java.util.Locale.US);
+        return n.contains("crashrecord")
+                || n.contains("safemode")
+                || n.contains("safe_mode")
+                || n.startsWith("crash_")
+                || n.startsWith("app_crash");
+    }
+
+    private static void deleteRecursively(java.io.File f) {
+        try {
+            java.io.File[] children = f.listFiles();
+            if (children != null) {
+                for (java.io.File c : children) {
+                    deleteRecursively(c);
+                }
+            }
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 把某个虚拟应用的数据目录「快照」进诊断日志。
+     *
+     * 没有 root 时宿主读不到 `/data/data/<pkg>`，但这段代码跑在虚拟进程内部、
+     * 用的是应用自己的 uid，能读。用于回答「应用把安全模式计数记在哪」这种问题：
+     * 顶层条目名 + 大小，命中崩溃/安全模式关键字的文本文件再带上内容。
+     */
+    private static void dumpAppDataDigest(java.io.File dataDir, String reason) {
+        try {
+            java.io.File[] children = dataDir.listFiles();
+            if (children == null) {
+                return;
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("AppData",
+                    reason + " dir=" + dataDir.getAbsolutePath() + " entries=" + children.length);
+            int shown = 0;
+            for (java.io.File f : children) {
+                if (shown++ >= 40) break;
+                String n = f.getName();
+                long len = f.isFile() ? f.length() : -1L;
+                top.niunaijun.blackbox.utils.DiagLog.log("AppData",
+                        "  " + n + (f.isDirectory() ? "/ dir" : " file " + len + "B"));
+                if (f.isFile() && len > 0 && len <= 2048 && isSafeModeArtifact(n)) {
+                    try {
+                        String text = new String(
+                                java.nio.file.Files.readAllBytes(f.toPath()),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        top.niunaijun.blackbox.utils.DiagLog.log("AppData",
+                                "  content[" + n + "]=" + text.replace('\n', '|'));
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("AppData",
+                    "digest failed: " + t.getClass().getSimpleName());
         }
     }
 
@@ -3503,6 +3635,15 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
 
     private static void dumpDiagnostics(Application app, String reason) {
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "=== dump begin (" + reason + ") ===");
+        // 虚拟应用自己的数据目录快照：崩溃计数 / 安全模式标记都记在这里，
+        // 宿主侧（adb shell）没有权限读，只能在进程内部看。
+        try {
+            if (app != null && !"com.adv.runner.AdvApp".equals(app.getClass().getName())
+                    && app.getFilesDir() != null) {
+                dumpAppDataDigest(app.getFilesDir().getParentFile(), "diag");
+            }
+        } catch (Throwable ignored) {
+        }
         installRequestQueue(app);
         probeThreadPriority();
         dumpLaunchTasks(app);

@@ -439,7 +439,9 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             String resolvedType = (String) args[intentIndex + 1];
             Intent proxyIntent = BlackBoxCore.getBActivityManager().sendBroadcast(intent, resolvedType, BActivityThread.getUserId());
             if (proxyIntent != null) {
-                proxyIntent.setExtrasClassLoader(BActivityThread.getApplication().getClassLoader());
+                // Application 可能还没绑定（应用在 onCreate 里就用协程发广播），
+                // 这里必须空安全，否则 hook 自己抛 NPE 会把整个进程打死。
+                top.niunaijun.blackbox.utils.AppClassLoader.applyTo(proxyIntent);
                 ProxyBroadcastRecord.saveStub(proxyIntent, intent, BActivityThread.getUserId());
                 args[intentIndex] = proxyIntent;
             }
