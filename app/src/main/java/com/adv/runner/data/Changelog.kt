@@ -21,6 +21,74 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 91,
+            versionName = "0.9.27",
+            title = "实例操作收口为一行三个：启动 / 停止 合二为一",
+            highlights = listOf(
+                "「启动」和「停止」合成同一个状态按钮：运行中或启动中显示「停止」，未运行显示「启动」，上次异常退出显示「重新启动」，点击就是对当前状态该做的那一个动作",
+                "操作区从 2×2 变成一行三列：主按钮 + 强制停止 + 删除，三个等宽同高",
+                "同位置不再并列两个互斥按钮，避免「启动」和「停止」同时可点造成的歧义",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 90,
+            versionName = "0.9.26",
+            title = "首页布局微调：CTA 居中，实例操作固定 2×2",
+            highlights = listOf(
+                "「导入 APK」按钮水平居中（宽屏下不再靠左贴边，仍限制在 320dp 内不铺满整行）",
+                "实例卡片的四个操作改成固定两行两列：启动 / 停止 / 强制停止 / 删除 各自占半宽，四格同宽同高",
+                "取消「宽屏一行四个」的断点切换，宽屏窄屏观感统一，不再出现一行四个时按钮被压扁的情况",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 89,
+            versionName = "0.9.25",
+            title = "首页按钮收口：不再有大长条，实例操作四个等宽",
+            highlights = listOf(
+                "「导入 APK」在宽屏（平板 / PC 模式）下不再铺满整行，限到 320dp；实测从 2884px 收到 840px，手机上仍是整行宽",
+                "实例卡片的四个操作按钮改成等宽栅格：宽屏一行四个，窄屏 2×2，实测宽度 491/492/492/492 —— 之前「删除」独占一行被拉成两千多像素的长条",
+                "强调层级按 Material 3 收口：启动是卡片唯一主动作用的实心按钮，停止 / 强制停止用描边，删除用 error 色描边（点击仍走二次确认）",
+                "所有按钮最小高度 48dp（实测 126px），相邻间距 8dp，符合 WCAG 2.2 触控目标要求",
+                "新增 Dimens 尺寸与间距令牌，把散落在界面里的字面量收进 theme/Dimens.kt",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 88,
+            versionName = "0.9.24",
+            title = "不再接管请求队列：改回原调度层，只修好它的线程池",
+            highlights = listOf(
+                "反汇编 base.apk 确认了 jb0.a 的语义：只有 a(c) 和 b(c) 两个方法，都返回 void，分别转调 dispatcher.d.h.f() 和 dispatcher.d.h.e() —— 都是「提交」，不存在返回值触发重试的问题，之前怀疑的代理空转不成立",
+                "但接管确实绕过了 dispatcher.d 的调度层：优先级、并发上限、以及最重要的请求去重/合并；去重没了，预加载和用户请求重复的部分会各跑一遍",
+                "既然 dispatcher.d 的池已经被我们换成可用的池，原队列自己就能跑，于是默认不再接管（QUEUE_TAKEOVER=false），只保留修池",
+                "保留开关便于 A/B：若功能回退（不加载、不播放），改回 true 即可",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 87,
+            versionName = "0.9.23",
+            title = "取消 Lynx 屏外卡片的特权优先级",
+            highlights = listOf(
+                "0.9.22 实测：播放中 CPU 从 783% 降到 374%，但 CPU4 仍 104.7°C（阈值 105°C）",
+                "新热点不在解码：渲染是 SurfaceView + BLAST 硬解，解码线程累计 CPU 很低",
+                "真正的头是 lynx-card-service 与 LynxTimingCoroutine —— 全屏播放时屏幕上根本没有卡片，它们却占了约 1.2 个核，且被 App 抬到 nice=-8，优先级比播放器还高",
+                "新增第二档降级：只取消这些线程的特权（nice 降到 0），不压到后台，避免 Feed 滚动明显变卡；埋点/监控/预加载仍是 nice=10",
+                "顺带确认：进程里有 5 套解码器实例（VDecod2-V2~V5），即同时预加载了多集",
+            ),
+        ),
+        ChangelogEntry(
+            versionCode = 86,
+            versionName = "0.9.22",
+            title = "平板发烫：给线程池加并发上限，闲置时自动压后台",
+            highlights = listOf(
+                "实测：停在短剧播放页时 783% / 800% CPU（整机 98%），退回首页后同一个进程只剩 23% —— 发热来自播放页上的并发任务爆炸，不是后台常驻空转；408 个线程里 83 个处于可运行态，loadavg 97",
+                "结构性问题：进程落在 cpu:/vip + cpuset:/vip cgroup（微信是 /key-background、Telegram 是 /background），系统永不降级，只能自己降",
+                "限流：把接管的四处 newCachedThreadPool 全换成固定并发池（TTExecutors 4、dispatcher 3、请求队列 6、Rx 兜底 8），线程数封顶、任务排队不丢",
+                "旁路线程降级：启动 15 秒后开始，每 60 秒扫一次线程表，把埋点/监控/上报/预加载类线程统一降到 THREAD_PRIORITY_BACKGROUND；播放、解码、渲染、UI、binder 全部排除在名单外",
+                "降级最初设计成「空闲 30 秒才触发」，但播放时音频一直活跃、永远不满足条件，覆盖不到真正发热的场景，因此改为常驻",
+                "注意：调度优先级只能单向降低（非特权进程抬不回去），所以只作用于本来就不该占优先级的旁路线程",
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 85,
             versionName = "0.9.21",
             title = "视频终于能正常播放：找到「线程池只收不做」的总根因",

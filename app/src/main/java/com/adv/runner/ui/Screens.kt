@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.widthIn
@@ -58,6 +59,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.adv.runner.R
 import com.adv.runner.core.model.ExitReason
 import com.adv.runner.core.model.RuntimeState
+import com.adv.runner.ui.theme.Dimens
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
@@ -289,10 +291,19 @@ private fun HomeScreen(state: AppState, scope: CoroutineScope) {
             }
         }
 
+        // 宽屏下不再铺满整行：限到 CTA 最大宽度并居中，
+        // 窄屏仍然撑满（fillMaxWidth 在 max 之内生效）。
         Button(
             onClick = { picker.launch(APK_MIME_TYPES) },
             enabled = !state.busy,
-            modifier = Modifier.fillMaxWidth()
+            // 顺序不能反：widthIn 必须写在 fillMaxWidth 之前。
+            // 反过来写时，fillMaxWidth 会把 min 一起顶成父容器宽度，
+            // widthIn 的 max 就被 min 顶掉了，按钮又变回长条。
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .widthIn(max = Dimens.ctaMaxWidth)
+                .fillMaxWidth()
+                .heightIn(min = Dimens.minButtonHeight)
         ) { Text("导入 APK") }
 
         if (state.busy) {

@@ -6,18 +6,22 @@ import androidx.compose.animation.core.tween
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -47,10 +51,14 @@ import com.adv.runner.core.model.RunEvent
 import com.adv.runner.core.model.RuntimeInstance
 import com.adv.runner.core.model.RuntimeState
 import com.adv.runner.core.model.Severity
+import com.adv.runner.ui.theme.Dimens
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+/** 实例卡片操作区的列数：固定 3 列（启动/停止 合一 + 强制停止 + 删除）。 */
+private const val ACTION_GRID_COLUMNS = 3
 
 /* ---------------- 通用状态组件（空态 / 错误态 / 加载态） ---------------- */
 
@@ -81,7 +89,12 @@ fun EmptyState(
             )
         }
         if (actionLabel != null && onAction != null) {
-            Button(onClick = onAction, modifier = Modifier.padding(top = 20.dp)) { Text(actionLabel) }
+            Button(
+                onClick = onAction,
+                modifier = Modifier
+                    .padding(top = 20.dp)
+                    .heightIn(min = Dimens.minButtonHeight)
+            ) { Text(actionLabel) }
         }
     }
 }
@@ -216,30 +229,108 @@ fun InstanceRow(
                 }
             }
 
-            // 操作按钮单独一行，避免窄屏被挤成换行
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = onLaunch,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f)
-                ) { Text(if (abnormal) "重新启动" else "启动", maxLines = 1) }
-                OutlinedButton(
-                    onClick = onStop,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f)
-                ) { Text("停止", maxLines = 1) }
-                OutlinedButton(
-                    onClick = onForceStop,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f)
-                ) { Text("强制停止", maxLines = 1) }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = onDelete,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f)
-                ) { Text("删除", maxLines = 1) }
+            // 操作区：统一走等宽栅格，不再让「删除」独占一行被拉成长条
+            InstanceActions(
+                state = instance.state,
+                abnormal = abnormal,
+                busy = busy,
+                onLaunch = onLaunch,
+                onStop = onStop,
+                onForceStop = onForceStop,
+                onDelete = onDelete
+            )
+        }
+    }
+}
+
+/**
+ * 实例卡片的三个操作，一行三列等宽排布。
+ *
+ * 演进过程：最早是「三个一行 + 删除独占一行」，删除被拉成 2000dp 的长条；
+ * 之后改成宽屏一行四个、窄屏 2×2；现在把「启动 / 停止」合成一个状态按钮，
+ * 一行三个收口：
+ * - 主按钮随状态切换：运行中/启动中显示「停止」，否则显示「启动」（异常退出显示
+ *   「重新启动」）。同一位置只放当前真正可用的那一个动作，避免两个互斥按钮并列；
+ * - 强调层级：主按钮是卡片唯一的主动作用 filled（BTN-001），
+ *   强制停止用 outlined，删除是破坏性操作用 error 色 + outlined，
+ *   点击后仍走二次确认（BTN-009）；
+ * - 每个按钮最小 48dp 高，间距 8dp（BTN-002 / BTN-003）；
+ * - 按钮语义随状态变化，同时保留文案本身，不靠颜色单独传达含义（BTN-015）。
+ */
+@Composable
+private fun InstanceActions(
+    state: RuntimeState,
+    abnormal: Boolean,
+    busy: Boolean,
+    onLaunch: () -> Unit,
+    onStop: () -> Unit,
+    onForceStop: () -> Unit,
+    onDelete: () -> Unit
+) {
+    // 运行中和启动中都算「停下来」的场景：启动中也能取消。
+    val active = state == RuntimeState.RUNNING || state == RuntimeState.STARTING
+    val primaryLabel = when {
+        active -> "停止"
+        abnormal -> "重新启动"
+        else -> "启动"
+    }
+    val actions: List<@Composable () -> Unit> = listOf(
+        {
+            Button(
+                onClick = if (active) onStop else onLaunch,
+                enabled = !busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = Dimens.minButtonHeight)
+            ) { Text(primaryLabel, maxLines = 1) }
+        },
+        {
+            OutlinedButton(
+                onClick = onForceStop,
+                enabled = !busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = Dimens.minButtonHeight)
+            ) { Text("强制停止", maxLines = 1) }
+        },
+        {
+            OutlinedButton(
+                onClick = onDelete,
+                enabled = !busy,
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error
+                ),
+                // 破坏性操作不能只靠文字颜色区分（BTN-015：不靠颜色单独传达含义），
+                // 描边也跟着走 error 色，禁用时降到 38% 保持「仍可感知」（BTN-007）。
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = MaterialTheme.colorScheme.error.copy(
+                        alpha = if (busy) 0.38f else 1f
+                    )
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = Dimens.minButtonHeight)
+            ) { Text("删除", maxLines = 1) }
+        }
+    )
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(Dimens.spaceSm)
+    ) {
+        // 一行三列：三个按钮永远同宽同高，不随屏宽改变列数。
+        actions.chunked(ACTION_GRID_COLUMNS).forEach { row ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(Dimens.spaceSm),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                row.forEach { action ->
+                    Box(modifier = Modifier.weight(1f)) { action() }
+                }
+                // 末行不满列时用 Spacer 撑住，保证上一行的按钮宽度不被拉伸
+                repeat(ACTION_GRID_COLUMNS - row.size) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
             }
         }
     }
