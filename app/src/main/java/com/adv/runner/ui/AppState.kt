@@ -11,10 +11,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.adv.runner.apk.ApkAnalyzer
+import com.adv.runner.apk.DeviceProfile
+import com.adv.runner.apk.VendorRom
 import com.adv.runner.apk.ApkStore
 import com.adv.runner.BuildConfig
 import com.adv.runner.MainActivity
 import com.adv.runner.core.control.InstanceController
+import com.adv.runner.core.control.ReconcileOutcome
 import com.adv.runner.core.model.ApkInfo
 import com.adv.runner.core.model.EngineCapabilities
 import com.adv.runner.core.model.EngineErrorCode
@@ -64,6 +67,8 @@ class AppState(
     val themeRepository: ThemeRepository,
     val deviceAbis: List<String>,
     val deviceSdk: Int,
+    /** 厂商 ROM 家族：只用于给出后台/悬浮窗的提示，不参与是否放行的判定。 */
+    val deviceVendorRom: VendorRom = VendorRom.UNKNOWN,
     private val scope: CoroutineScope,
     val debugApkPath: String? = null,
     /** 调试入口：启动时直接拉起该包名的已有实例。 */
@@ -121,6 +126,15 @@ class AppState(
 
     /** 引擎自检结果；非空表示自检已执行。 */
     var selfCheck by mutableStateOf<EngineSelfCheck?>(null)
+        private set
+
+    /**
+     * 最近一次「读不到 / 写不进」的持久化问题。
+     *
+     * 以前这些失败只写日志：用户看到的是「实例状态回退了」「刚删的又回来了」，
+     * 却没有任何解释。现在统一挂在这里，由首页顶部横幅展示，可手动关闭。
+     */
+    var persistenceWarning by mutableStateOf<String?>(null)
         private set
 
     /** 当前日志级别（可切换）。 */
@@ -483,8 +497,48 @@ class AppState(
             instances = persisted
             logger.info("AppState", "启动：磁盘实例 ${persisted.size} 个")
 
-            runCatching { migrator?.migrate() }
-                .onFailure { logger.warn("AppState", "旧版 JSON 迁移失败（已跳过）", it) }
+            val legacyMigrator = migrator
+            if (legacyMigrator != null) {
+                val report = runCatching { legacyMigrator.migrate() }
+                    .onFailure { logger.error("AppState", "旧版数据迁移抛异常", it) }
+                    .getOrNull()
+                when {
+                    report == null -> {
+                        persistenceWarning = "旧版数据迁移异常，原文件已保留"
+                    }
+                    report.skipped -> Unit
+                    !report.isSuccess -> {
+                        // 关键：迁移失败时原文件还在原处，不能假装"已完成"
+                        val detail = listOfNotNull(
+                            report.instanceError?.let { "实例清单：$it" },
+                            report.eventError?.let { "事件记录：$it" }
+                        ).joinToString("；")
+                        persistenceWarning = "旧版数据迁移失败（原文件已保留）：$detail"
+                        status = persistenceWarning!!
+                        logger.error("AppState", "旧版数据迁移失败：$detail")
+                        runCatching {
+                            record(
+                                RunEventType.RECONCILE,
+                                level = "ERROR",
+                                code = "LEGACY_MIGRATION_FAILED",
+                                message = persistenceWarning!!
+                            )
+                        }.onFailure { logger.warn("AppState", "写迁移失败事件失败", it) }
+                    }
+                    report.hasData -> {
+                        logger.info(
+                            "AppState",
+                            "旧版数据迁移完成：实例 ${report.instanceCount}、事件 ${report.eventCount}"
+                        )
+                        runCatching {
+                            record(
+                                RunEventType.RECONCILE,
+                                message = "旧版数据迁移完成：实例 ${report.instanceCount} 个、事件 ${report.eventCount} 条"
+                            )
+                        }.onFailure { logger.warn("AppState", "写迁移完成事件失败", it) }
+                    }
+                }
+            }
 
             val root = File(context.filesDir, "engine/blackbox")
             // ② 引擎初始化：失败/抛异常都不允许影响已加载的清单
@@ -503,12 +557,46 @@ class AppState(
             when (initResult) {
                 is EngineResult.Success -> {
                     caps = initResult.value
-                    // ③ 对账失败也不清空清单：宁可状态显示为"未知"，也不能让实例消失
-                    val reconciled = runCatching { controller.reconcile() }
-                        .onFailure { logger.error("AppState", "实例对账失败（保留磁盘状态）", it) }
+                    // ③ 对账失败也不清空清单：宁可状态显示为"未知"，也不能让实例消失。
+                    //    但对账内部的「读不到 / 写不进 / 哪条取证挂了」必须显式上报，
+                    //    不能再像以前那样只在日志里留一句话。
+                    val outcome = runCatching { controller.reconcile() }
+                        .onFailure { logger.error("AppState", "实例对账抛异常（保留磁盘状态）", it) }
                         .getOrNull()
-                    if (reconciled != null) {
-                        instances = reconciled
+                    if (outcome == null) {
+                        persistenceWarning = "实例对账异常，本次启动沿用磁盘状态"
+                    } else if (outcome.isFatal) {
+                        // 读盘失败：这不是"没有实例"，是不知道有哪些实例
+                        bootPhase = BootPhase.FAILED
+                        initError = "读取实例清单失败：${outcome.loadError}"
+                        status = initError!!
+                        logger.error("AppState", "对账中止：${outcome.loadError}")
+                        runCatching {
+                            record(
+                                RunEventType.RECONCILE,
+                                level = "ERROR",
+                                code = "INSTANCE_LOAD_FAILED",
+                                message = "读取实例清单失败：${outcome.loadError}"
+                            )
+                        }.onFailure { logger.warn("AppState", "写 RECONCILE 失败事件失败", it) }
+                        return
+                    } else {
+                        instances = outcome.instances
+                        if (outcome.hasWarnings) {
+                            persistenceWarning = buildPersistenceWarning(outcome)
+                            logger.warn(
+                                "AppState",
+                                "对账有告警：save=${outcome.saveError} failures=${outcome.failures.size}"
+                            )
+                            runCatching {
+                                record(
+                                    RunEventType.RECONCILE,
+                                    level = "WARN",
+                                    code = "RECONCILE_INCOMPLETE",
+                                    message = persistenceWarning!!
+                                )
+                            }.onFailure { logger.warn("AppState", "写 RECONCILE 告警事件失败", it) }
+                        }
                         runCatching { recordReconcileEvents(persisted) }
                             .onFailure { logger.warn("AppState", "写对账事件失败", it) }
                     }
@@ -590,7 +678,12 @@ class AppState(
                 deviceSdk = deviceSdk,
                 deviceAbis = deviceAbis,
                 engineSdkRange = engine.capabilities()?.supportedSdk,
-                engineAllows32Bit = true
+                engineAllows32Bit = true,
+                device = DeviceProfile(
+                    sdkInt = deviceSdk,
+                    abis = deviceAbis,
+                    vendorRom = deviceVendorRom
+                )
             )
             info.copy(issues = issues, originalFileName = originalFileName ?: info.originalFileName)
         }
@@ -675,7 +768,16 @@ class AppState(
         // 直接按 instances 取 max+1 会撞上 (engine_id, virtual_user_id) 唯一索引，
         // 整次落盘回滚，实例就"装上了但下次启动不见了"。
         val known = if (instances.isEmpty()) {
-            runCatching { store.load() }.getOrDefault(emptyList())
+            try {
+                store.load()
+            } catch (t: Throwable) {
+                // 读不到已有清单就不知道哪些 userId 被占了，硬装会撞 (engine_id,user_id)
+                // 唯一索引、整次落盘回滚，用户看到的是"装上了但下次启动消失"。
+                logger.error("AppState", "安装中止：读取已有实例清单失败", t)
+                persistenceWarning = "读取实例清单失败，已取消安装：${t.javaClass.simpleName}"
+                status = persistenceWarning!!
+                return null
+            }
         } else {
             instances
         }
@@ -1547,12 +1649,22 @@ class AppState(
         // 宁可多留一条，也不静默删除用户的数据。
         var target = list
         if (previous.isEmpty() && list.isNotEmpty()) {
-            val onDisk = runCatching { store.load() }.getOrDefault(emptyList())
-            val ids = list.mapTo(HashSet()) { it.id }
-            val missing = onDisk.filterNot { it.id in ids }
-            if (missing.isNotEmpty()) {
-                logger.warn("AppState", "内存清单为空但磁盘有 ${onDisk.size} 个实例，按并集写入")
-                target = missing + list
+            val onDisk = try {
+                store.load()
+            } catch (t: Throwable) {
+                // 读不到磁盘就退化成"只写内存里的这份"：宁可少写，也不能把
+                // "读失败"当作"磁盘为空"然后把历史实例覆盖掉。
+                logger.error("AppState", "并集写入前读取磁盘失败，本次仅写内存清单", t)
+                persistenceWarning = "读取磁盘实例失败，本次仅写入当前清单：${t.javaClass.simpleName}"
+                null
+            }
+            if (onDisk != null) {
+                val ids = list.mapTo(HashSet()) { it.id }
+                val missing = onDisk.filterNot { it.id in ids }
+                if (missing.isNotEmpty()) {
+                    logger.warn("AppState", "内存清单为空但磁盘有 ${onDisk.size} 个实例，按并集写入")
+                    target = missing + list
+                }
             }
         }
         instances = target
@@ -1589,6 +1701,27 @@ class AppState(
         if (selectedId != null && instance?.id == selectedId) {
             runEvents = eventStore.query(selectedId)
         }
+    }
+
+    /**
+     * 把对账结果里的失败压成一句人话。
+     *
+     * 只报"有 N 条失败"没有意义，用户需要知道是「没写进磁盘」还是「某几个实例查不到状态」。
+     */
+    private fun buildPersistenceWarning(outcome: ReconcileOutcome): String {
+        val parts = mutableListOf<String>()
+        outcome.saveError?.let { parts += "对账结果未能写入磁盘（$it），本次改动重启后会丢失" }
+        if (outcome.failures.isNotEmpty()) {
+            val names = outcome.failures.take(3).joinToString("、") { it.packageName }
+            val more = if (outcome.failures.size > 3) " 等 ${outcome.failures.size} 个" else ""
+            parts += "$names$more 状态取证失败，已沿用上次记录"
+        }
+        return parts.joinToString("；").ifEmpty { "对账未完全成功" }
+    }
+
+    /** 用户点掉持久化告警横幅。 */
+    fun dismissPersistenceWarning() {
+        persistenceWarning = null
     }
 
     /** 把对账产生的状态修正落成 CRASH/RECONCILE 事件。 */

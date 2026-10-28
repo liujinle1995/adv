@@ -1,6 +1,7 @@
 package com.adv.runner.data
 
 import androidx.room.withTransaction
+import com.adv.runner.core.control.InstanceDataSource
 import com.adv.runner.core.model.ApkInfo
 import com.adv.runner.core.model.RunEvent
 import com.adv.runner.core.model.RuntimeInstance
@@ -38,25 +39,30 @@ class ApkRepository(private val db: AdvDatabase) {
     }
 }
 
-class InstanceRepository(private val db: AdvDatabase) {
+class InstanceRepository(private val db: AdvDatabase) : InstanceDataSource {
 
-    suspend fun load(): List<RuntimeInstance> =
+    override suspend fun load(): List<RuntimeInstance> =
         db.runtimeInstanceDao().getAll().map { it.toModel() }
 
     /** 整体替换：事务内清空重写，语义等价于旧 JSON 文件的「整文件覆盖」。 */
-    suspend fun save(list: List<RuntimeInstance>) {
+    override suspend fun save(list: List<RuntimeInstance>) {
         db.withTransaction {
             db.runtimeInstanceDao().deleteAll()
             db.runtimeInstanceDao().upsertAll(list.map { it.toEntity() })
         }
     }
 
-    suspend fun delete(id: String) {
+    override suspend fun delete(id: String) {
         db.runtimeInstanceDao().deleteById(id)
     }
 }
 
-class EventRepository(private val db: AdvDatabase) {
+/** 事件写入契约：迁移器只需要「清空重写」，不依赖 Room 类型，便于纯 JVM 单测。 */
+interface EventSink {
+    suspend fun replaceAll(events: List<RunEvent>)
+}
+
+class EventRepository(private val db: AdvDatabase) : EventSink {
 
     /** 追加一条事件并回填自增 id（Room 保证线程安全，无需再手动 Mutex 串行）。 */
     suspend fun append(event: RunEvent): RunEvent {
@@ -65,7 +71,7 @@ class EventRepository(private val db: AdvDatabase) {
     }
 
     /** 整体替换（旧 JSONL 一次性迁入用）：事务内清空重写，id 交给 Room 自增以保持时间单调。 */
-    suspend fun replaceAll(events: List<RunEvent>) {
+    override suspend fun replaceAll(events: List<RunEvent>) {
         db.withTransaction {
             db.runEventDao().deleteAll()
             db.runEventDao().insertAll(events.map { it.copy(id = 0).toEntity() })

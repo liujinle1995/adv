@@ -32,6 +32,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -287,6 +288,32 @@ private fun HomeScreen(state: AppState, scope: CoroutineScope) {
             if (state.bootPhase == BootPhase.FAILED) {
                 TextButton(onClick = { state.retryInitialize() }, enabled = !state.busy) {
                     Text("重试", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+
+        // 持久化问题横幅：读不到 / 写不进清单时，用户必须知道
+        // 「刚才的改动可能没保存」，而不是自己发现实例状态回退了。
+        state.persistenceWarning?.let { warning ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer
+                )
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        warning,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { state.dismissPersistenceWarning() }) {
+                        Text("知道了", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
         }

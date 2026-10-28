@@ -19,6 +19,32 @@ import java.io.File
  */
 class InstanceStore(private val file: File) {
 
+    /**
+     * 严格读取：任何一条解析不出来就抛异常。
+     *
+     * 迁移必须用这个入口。[load] 会静默跳过坏记录，用它判断「能否搬迁」会把
+     * 「文件已损坏」误判成「文件里少了几条」，然后把原文件改名 .bak 藏起来。
+     */
+    fun loadStrict(): List<RuntimeInstance> {
+        if (!file.isFile) return emptyList()
+        val root = JSONArray(file.readText())
+        val items = ArrayList<RuntimeInstance>(root.length())
+        val errors = mutableListOf<String>()
+        for (i in 0 until root.length()) {
+            try {
+                items += parse(root.getJSONObject(i))
+            } catch (t: Throwable) {
+                errors += "#$i ${t.javaClass.simpleName}: ${t.message}"
+            }
+        }
+        if (errors.isNotEmpty()) {
+            throw IllegalStateException(
+                "实例清单有 ${errors.size}/${root.length()} 条无法解析（${errors.first()}）"
+            )
+        }
+        return items
+    }
+
     fun load(): List<RuntimeInstance> {
         if (!file.isFile) return emptyList()
         return runCatching {

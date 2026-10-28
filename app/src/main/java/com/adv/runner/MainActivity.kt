@@ -17,6 +17,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import com.adv.runner.apk.ApkAnalyzer
+import com.adv.runner.apk.VendorRomDetector
 import com.adv.runner.apk.ApkStore
 import com.adv.runner.core.control.InstanceController
 import com.adv.runner.data.ApkRepository
@@ -67,7 +68,7 @@ class MainActivity : ComponentActivity() {
                         val store = InstanceRepository(db)
                         val eventStore = EventRepository(db)
                         val apkRepository = ApkRepository(db)
-                        val migrator = LegacyMigrator(appContext, store, eventStore)
+                        val migrator = LegacyMigrator(appContext.filesDir, store, eventStore)
                         AppState(
                             context = appContext,
                             logger = logger,
@@ -75,13 +76,14 @@ class MainActivity : ComponentActivity() {
                             engine = engine,
                             store = store,
                             eventStore = eventStore,
-                            controller = InstanceController(store, engine),
+                            controller = InstanceController(store, engine, logger),
                             migrator = migrator,
                             apkStore = ApkStore(File(appContext.filesDir, "apks")),
                             apkRepository = apkRepository,
                             themeRepository = themeRepository,
                             deviceAbis = Build.SUPPORTED_ABIS.toList(),
                             deviceSdk = Build.VERSION.SDK_INT,
+                            deviceVendorRom = VendorRomDetector.fromBuild(),
                             scope = (appContext as AdvApp).appScope,
                             debugApkPath = intent?.getStringExtra(EXTRA_DEBUG_APK),
                             debugLaunchPkg = intent?.getStringExtra(EXTRA_DEBUG_LAUNCH),

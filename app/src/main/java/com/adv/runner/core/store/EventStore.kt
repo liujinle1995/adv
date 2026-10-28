@@ -53,6 +53,35 @@ class EventStore(private val file: File) {
             events
         }
 
+    /**
+     * 严格查询：坏行直接抛，供迁移判断能否安全搬迁。
+     *
+     * [query] 会跳过解析失败的行走，用它做迁移判断会让「文件损坏」看起来像
+     * 「事件比较少」，进而把损坏文件改名 .bak，历史事件就此消失。
+     */
+    suspend fun queryStrict(instanceId: String?, limit: Int = Int.MAX_VALUE): List<RunEvent> =
+        withContext(Dispatchers.IO) {
+            if (!file.isFile) return@withContext emptyList()
+            val lines = file.readLines().filter { it.isNotBlank() }
+            val parsed = ArrayList<RunEvent>(lines.size)
+            val errors = mutableListOf<String>()
+            lines.forEachIndexed { index, line ->
+                try {
+                    parsed += parse(JSONObject(line))
+                } catch (t: Throwable) {
+                    errors += "第 ${index + 1} 行 ${t.javaClass.simpleName}: ${t.message}"
+                }
+            }
+            if (errors.isNotEmpty()) {
+                throw IllegalStateException(
+                    "事件文件有 ${errors.size}/${lines.size} 行无法解析（${errors.first()}）"
+                )
+            }
+            parsed.filter { instanceId == null || it.instanceId == instanceId }
+                .takeLast(limit)
+                .reversed()
+        }
+
     fun clear() {
         runCatching { file.delete() }
     }
