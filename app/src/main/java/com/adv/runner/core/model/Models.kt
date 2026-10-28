@@ -95,7 +95,54 @@ data class RuntimeInstance(
 
 /* ---------------- 引擎能力与结果 ---------------- */
 
-enum class Capability { SUPPORTED, PARTIAL, UNSUPPORTED, UNKNOWN }
+/**
+ * 引擎能力的**三态**结论。
+ *
+ * 刻意只有三种取值，不允许再引入 `PARTIAL` 之类的模糊档：
+ * - [SUPPORTED]：已实测通过，可以依赖；
+ * - [UNSUPPORTED]：已确认不可用，必须拦住依赖它的功能；
+ * - [UNKNOWN]：**没验证过**，既不等于支持也不等于不支持。
+ *
+ * 「部分支持」这种描述属于实现细节，写进 [EngineCapabilities.notes] 里，
+ * 不参与流程判断——否则每个调用点都要自己解释 PARTIAL 该算支持还是不支持。
+ */
+enum class Capability {
+    SUPPORTED,
+    UNSUPPORTED,
+    UNKNOWN;
+
+    /** 是否已有确定结论（SUPPORTED / UNSUPPORTED）。 */
+    val isKnown: Boolean get() = this != UNKNOWN
+
+    /** 是否确认支持。UNKNOWN 不算支持。 */
+    val isConfirmedSupported: Boolean get() = this == SUPPORTED
+}
+
+/**
+ * 依赖某项能力时的动作裁决：把「三态」翻译成流程里唯一允许的三种行为，
+ * 避免各调用点各写一套 `if (cap != null && cap != UNSUPPORTED)`。
+ */
+enum class CapabilityDecision {
+    /** 可以执行。 */
+    ALLOW,
+
+    /** 功能依赖的能力已确认不可用，必须拦住。 */
+    BLOCK,
+
+    /** 能力未验证，允许继续但必须让用户确认风险。 */
+    CONFIRM
+}
+
+fun Capability.decide(): CapabilityDecision = when (this) {
+    Capability.SUPPORTED -> CapabilityDecision.ALLOW
+    Capability.UNSUPPORTED -> CapabilityDecision.BLOCK
+    Capability.UNKNOWN -> CapabilityDecision.CONFIRM
+}
+
+/** 能力缺失（引擎尚未报告该字段）与 UNKNOWN 同义处理，不再单独开分支。 */
+fun Capability?.decideOrUnknown(): CapabilityDecision =
+    (this ?: Capability.UNKNOWN).decide()
+
 
 data class EngineCapabilities(
     val engineId: String,

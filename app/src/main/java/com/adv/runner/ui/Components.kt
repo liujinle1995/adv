@@ -46,6 +46,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.adv.runner.core.model.ApkInfo
 import com.adv.runner.core.model.Capability
+import com.adv.runner.core.model.CapabilityDecision
+import com.adv.runner.core.model.decideOrUnknown
 import com.adv.runner.core.model.ExitReason
 import com.adv.runner.core.model.RunEvent
 import com.adv.runner.core.model.RuntimeInstance
@@ -476,13 +478,14 @@ fun SignatureConflictDialog(
     onCoexist: () -> Unit,
     onCancel: () -> Unit
 ) {
-    // 「并存」是否可用取决于引擎能力：UNKNOWN/SUPPORTED/PARTIAL 允许尝试（但 UNKNOWN 需警示），UNSUPPORTED 禁用
-    val coexistEnabled = engineSupportsCoexist != Capability.UNSUPPORTED
-    val coexistHint = when (engineSupportsCoexist) {
-        Capability.UNKNOWN -> "引擎能力未验证，并存可能失败"
-        Capability.SUPPORTED -> "引擎支持同包名不同签名并存"
-        Capability.PARTIAL -> "引擎部分支持并存，可能受限"
-        else -> null
+    // 「并存」是否可用取决于引擎能力，按三态裁决：
+    // SUPPORTED → 可点；UNKNOWN → 可点但必须警示；UNSUPPORTED → 禁用。
+    val decision = engineSupportsCoexist.decideOrUnknown()
+    val coexistEnabled = decision != CapabilityDecision.BLOCK
+    val coexistHint = when (decision) {
+        CapabilityDecision.CONFIRM -> "引擎能力未验证，并存可能失败"
+        CapabilityDecision.ALLOW -> "引擎支持同包名不同签名并存"
+        CapabilityDecision.BLOCK -> null
     }
 
     AlertDialog(

@@ -119,71 +119,29 @@ class ApkAnalyzer(private val context: Context) {
     }
 
     /**
-     * 兼容性判定。所有结论都可解释，不允许"凭感觉判死"。
+     * 兼容性判定。
+     *
+     * 规则本体在 [CompatibilityRules]（纯函数，可被测试矩阵穷举），
+     * 这里只负责把 [ApkInfo] + 设备信息装成输入。
      */
     fun checkCompat(
         info: ApkInfo,
         deviceSdk: Int,
         deviceAbis: List<String>,
         engineSdkRange: IntRange? = null,
-        engineAllows32Bit: Boolean = true
-    ): List<CompatIssue> {
-        val issues = mutableListOf<CompatIssue>()
-
-        if (info.minSdk > deviceSdk) {
-            issues += CompatIssue(
-                Severity.BLOCKER,
-                "MIN_SDK_TOO_HIGH",
-                "该应用要求 Android API ${info.minSdk} 及以上，当前设备为 API $deviceSdk，无法运行。"
-            )
-        }
-        if (engineSdkRange != null && deviceSdk !in engineSdkRange) {
-            issues += CompatIssue(
-                Severity.BLOCKER,
-                "ENGINE_SDK_UNSUPPORTED",
-                "当前运行引擎仅声明支持 API ${engineSdkRange.first}–${engineSdkRange.last}，本机为 API $deviceSdk，需实测确认。"
-            )
-        }
-        if (info.abis.isNotEmpty()) {
-            val supported = info.abis.any { it in deviceAbis }
-            if (!supported) {
-                issues += CompatIssue(
-                    Severity.BLOCKER,
-                    "ABI_MISMATCH",
-                    "该应用包含原生库（${info.abis.joinToString()}），与设备 ABI（${deviceAbis.joinToString()}）不匹配。"
-                )
-            }
-            val only32Bit = info.abis.all { it == "armeabi-v7a" || it == "armeabi" || it == "x86" }
-            if (only32Bit && !engineAllows32Bit) {
-                issues += CompatIssue(
-                    Severity.BLOCKER,
-                    "ONLY_32BIT",
-                    "该应用仅有 32 位原生库，当前引擎/设备不支持 32 位应用。"
-                )
-            }
-        }
-        if (info.targetSdk < 23) {
-            issues += CompatIssue(
-                Severity.WARN,
-                "TARGET_SDK_TOO_LOW",
-                "targetSdk=${info.targetSdk} 过低。系统安装器通常会拒绝此类 APK；沙箱内是否受限需实测。"
-            )
-        } else if (info.targetSdk <= deviceSdk - 4) {
-            issues += CompatIssue(
-                Severity.WARN,
-                "TARGET_SDK_OLD",
-                "targetSdk=${info.targetSdk} 明显低于设备 API $deviceSdk，可能命中系统行为变更。"
-            )
-        }
-        if (info.permissions.any { it.dangerous }) {
-            issues += CompatIssue(
-                Severity.INFO,
-                "DANGEROUS_PERMISSIONS",
-                "该应用声明了 ${info.permissions.count { it.dangerous }} 个危险权限，请在详情页逐项确认。"
-            )
-        }
-        return issues
-    }
+        engineAllows32Bit: Boolean = true,
+        device: DeviceProfile = DeviceProfile(sdkInt = deviceSdk, abis = deviceAbis)
+    ): List<CompatIssue> = CompatibilityRules.check(
+        apk = ApkCompatInput(
+            minSdk = info.minSdk,
+            targetSdk = info.targetSdk,
+            abis = info.abis,
+            dangerousPermissionCount = info.permissions.count { it.dangerous }
+        ),
+        device = device,
+        engineSdkRange = engineSdkRange,
+        engineAllows32Bit = engineAllows32Bit
+    )
 
     /* ---------------- 内部实现 ---------------- */
 

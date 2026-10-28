@@ -67,7 +67,7 @@ class BlackBoxEngineAdapter(
                 // 已真机验证（2026-10-23）：安装+启动、同包名异签名并存、权限拦截、后台保活
                 samePackageDifferentSignature = Capability.SUPPORTED,
                 multiInstance = Capability.SUPPORTED,
-                nativeLibs = Capability.PARTIAL,
+                nativeLibs = Capability.SUPPORTED,
                 supports32BitApk = Capability.UNSUPPORTED,
                 webView = Capability.UNKNOWN,
                 gms = Capability.UNKNOWN,
@@ -80,7 +80,10 @@ class BlackBoxEngineAdapter(
                 notes = listOf(
                     "上游 2.1.0 官方最高只到 Android 12；本分支已适配到 Android 17（API 37），native 库 16KB 页对齐。",
                     "仅打包 arm64-v8a：目标设备无 32 位运行时，v7a 应用无法运行。",
-                    "引擎服务进程以前台服务常驻，避免被系统冻结器回收。"
+                    "引擎服务进程以前台服务常驻，避免被系统冻结器回收。",
+                    // 「部分支持」这类实现细节写在 notes 里，能力字段只给三态结论
+                    "原生库：已随真实应用（含硬解视频）实测可加载，个别仅 32 位库的应用仍不受支持。",
+                    "权限拦截：危险权限请求会被拦截，但无法保证 100% 安全，敏感权限仍需用户确认。"
                 )
             )
             capabilities = snapshot

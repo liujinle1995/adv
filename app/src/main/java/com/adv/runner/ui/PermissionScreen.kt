@@ -57,15 +57,13 @@ fun PermissionScreen(state: AppState) {
                 Text("引擎权限拦截能力", fontWeight = FontWeight.SemiBold)
                 Text(
                     when (interception) {
-                        Capability.SUPPORTED -> "已确认拦截：危险权限请求会被引擎真正拦截。"
-                        Capability.PARTIAL -> "部分拦截：部分权限能拦截，部分可能放行（详见下方标注）。"
+                        Capability.SUPPORTED -> "已确认拦截：危险权限请求会被引擎拦截（个别权限仍可能放行，见下方逐项标注）。"
                         Capability.UNSUPPORTED -> "未拦截：引擎不拦截权限，应用可直接使用。"
                         Capability.UNKNOWN -> "未验证：拦截能力尚未实测，无法承诺安全。"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = when (interception) {
                         Capability.SUPPORTED -> MaterialTheme.colorScheme.primary
-                        Capability.PARTIAL -> MaterialTheme.colorScheme.tertiary
                         Capability.UNSUPPORTED, Capability.UNKNOWN -> MaterialTheme.colorScheme.error
                     }
                 )
@@ -106,7 +104,6 @@ private fun PermissionRow(permission: ApkPermission, interception: Capability) {
                 style = MaterialTheme.typography.labelSmall,
                 color = when (interception) {
                     Capability.SUPPORTED -> MaterialTheme.colorScheme.primary
-                    Capability.PARTIAL -> MaterialTheme.colorScheme.tertiary
                     Capability.UNSUPPORTED, Capability.UNKNOWN -> MaterialTheme.colorScheme.error
                 }
             )
@@ -116,7 +113,6 @@ private fun PermissionRow(permission: ApkPermission, interception: Capability) {
 
 private fun interceptionLabel(capability: Capability): String = when (capability) {
     Capability.SUPPORTED -> "已确认拦截"
-    Capability.PARTIAL -> "部分拦截（可能放行）"
     Capability.UNSUPPORTED -> "未拦截"
     Capability.UNKNOWN -> "未验证"
 }

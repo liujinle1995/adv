@@ -233,7 +233,6 @@ private fun StatusLine(label: String, value: String) {
 
 private fun Capability.label(): String = when (this) {
     Capability.SUPPORTED -> "支持"
-    Capability.PARTIAL -> "部分"
     Capability.UNSUPPORTED -> "不支持"
     Capability.UNKNOWN -> "未验证"
 }
