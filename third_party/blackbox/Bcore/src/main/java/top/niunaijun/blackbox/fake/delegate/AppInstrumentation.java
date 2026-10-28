@@ -3085,17 +3085,39 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     }
 
     /**
-     * 关掉 bytex 的「所有核心线程都允许超时」。
+     * 修 bytex（字节的线程收敛框架）的三个全局开关。
      *
-     * `PThreadScheduledThreadPoolExecutor` 的构造函数里有：
-     *   if (SuperThreadPool.allowAllCoreThreadTimeOut) {
-     *       setKeepAliveTime(...);          // 但 setKeepAliveTime 被重写成
-     *                                      // “仅 enableBlockFetchTask 为 true 才生效”
-     *       allowCoreThreadTimeOut(true);
-     *   }
-     * 结果是「允许回收核心线程 + 保活时间还是默认 10ms」的组合。
-     * 实测这种池在沙箱里投任务后 poolSize=0、queued=0、completed=0 —— 线程根本没起来。
-     * 把开关关掉，池就退回标准 ScheduledThreadPoolExecutor 行为。
+     * 这里踩过一个大坑，写清楚免得再走一遍：运行红果时整机 8 核被跑满
+     * （进程 745% CPU、loadavg 89、SoC 105℃），热源 100% 来自这个进程。
+     * 线程级采样显示 78 个线程同时满载，且全部 wchan=0、
+     * voluntary_ctxt_switches 只有几十次、nonvoluntary 五万以上 ——
+     * 是纯用户态死循环，不是在等锁、也不是线程泄漏。
+     *
+     * 根因链条：
+     *   1. bytex 把线程池队列包成 BlockingQueueProxy；
+     *   2. 它的 take() 实现是「return poll()」——无参 poll 非阻塞，取不到就返回 null；
+     *   3. ThreadPoolExecutor.getTask() 里 timed = allowCoreThreadTimeOut ||
+     *      wc > corePoolSize，固定池 wc 永远不超过 corePoolSize，
+     *      所以 timed 完全由 allowCoreThreadTimeOut 决定：
+     *        true  → workQueue.poll(keepAliveTime)  阻塞，正确
+     *        false → workQueue.take()               空转
+     *   4. 我们之前把 allowAllCoreThreadTimeOut 关成 false（为了修 Scheduled 池），
+     *      于是所有固定池都掉进 take() 分支，getTask() 的 for(;;) 立刻重试。
+     *
+     * 真机上这个开关默认 true，核心线程永远走 poll(timeout) 的阻塞分支，
+     * take() 从不被调用，所以上游从没暴露过这个缺陷。
+     *
+     * 为什么不能用 inline hook 只修 take()：本机 Pine 在
+     * pine::Android::InitMembersFromRuntime 里 Data Abort，Pine_init0 直接
+     * SIGABRT，整个虚拟进程起不来（已实测，dropbox 有 tombstone）。
+     *
+     * 所以只能回到开关本身。代价是 Scheduled 池
+     * （PThreadScheduledThreadPoolExecutor）建池时会把 keepAliveTime 写成 30 **毫秒**
+     * 再 allowCoreThreadTimeOut(true)，核心线程 30ms 空闲就被回收 —— 当年正是
+     * 因为这个才把开关关掉的。但那一版同时还有 Keva 执行器卡死、启动 latch
+     * 卡死等问题，poolSize=0 未必是这个开关单独造成的。现在的取舍是：
+     * 用「Scheduled 池核心线程可能被频繁重建」换「所有固定池不再空转」，
+     * 前者有 ensurePrestart() 兜底重建、功能可用，后者是整机满载发烫。
      */
     private static void fixBytexThreadPool(Application app) {
         try {
@@ -3107,21 +3129,31 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             if (obj == null) {
                 return;
             }
+            // 1) 必须 true：让核心线程走 poll(keepAliveTime) 的阻塞分支，
+            //    绕开 bytex 那个坏掉的 take()。
             java.lang.reflect.Method setAllow = stp.getMethod(
                     "setAllowAllCoreThreadTimeOut", boolean.class);
-            setAllow.invoke(obj, false);
-            // 更关键：ThreadFactoryProxy.newThread 会把线程包成 ThreadProxy
-            // （new ThreadProxy(thread, false, 2, null)），包完之后任务就不再执行了。
-            // 是否包装由 SuperThreadPool.mEnable 位掩码控制（代理类型传的是 8）。
-            // 把位掩码清 0，代理直接返回原始线程，bytex 的线程收敛等于关闭。
+            setAllow.invoke(obj, true);
+            // 2) 必须 true：BlockingQueueProxy.poll(timeout) 只有在这个开关为 true
+            //    时才真正委托队列的阻塞 poll，否则同样退化成无参 poll —— 又一轮空转。
+            java.lang.reflect.Method setFetch = stp.getMethod(
+                    "setEnableBlockFetchTask", boolean.class);
+            setFetch.invoke(obj, true);
+            // 3) 清 0：ThreadFactoryProxy.newThread 会把线程包成 ThreadProxy
+            //    （new ThreadProxy(thread, false, 2, null)），包完之后任务就不再执行了。
+            //    是否包装由 SuperThreadPool.mEnable 位掩码控制（代理类型传的是 8）。
+            //    把位掩码清 0，代理直接返回原始线程，bytex 的线程收敛等于关闭。
             java.lang.reflect.Method setEnableType = stp.getMethod("setEnableType", int.class);
             setEnableType.invoke(obj, 0);
+
             java.lang.reflect.Method isEnable = stp.getMethod("isEnable", int.class);
             Object enable8 = isEnable.invoke(obj, 8);
             Object enable1 = isEnable.invoke(obj, 1);
             Object v = stp.getMethod("getAllowAllCoreThreadTimeOut").invoke(obj);
+            Object f = stp.getMethod("getEnableBlockFetchTask").invoke(obj);
             top.niunaijun.blackbox.utils.DiagLog.log("Pool",
                     "SuperThreadPool allowCoreTimeOut=" + v
+                            + " blockFetchTask=" + f
                             + " isEnable(8)=" + enable8 + " isEnable(1)=" + enable1);
         } catch (Throwable t) {
             top.niunaijun.blackbox.utils.DiagLog.log("Pool",

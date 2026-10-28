@@ -21,6 +21,21 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 94,
+            versionName = "0.9.30",
+            title = "修复运行字节系应用时整机跑满、发烫：线程池核心线程不再空转",
+            highlights = listOf(
+                "现象：沙箱里跑红果，进程长期占用 700%~750% CPU（8 核跑满 7.5 核），loadavg 89，SoC 105℃，cgroup 在 /vip 不会被系统降级，温度下不来",
+                "定位：线程级采样发现 78 个线程同时满载，且全部 wchan=0、voluntary_ctxt_switches 只有几十次、nonvoluntary 五万以上——是纯用户态死循环，不是在等锁，也不是线程泄漏",
+                "根因：bytex（字节的线程收敛框架）把线程池队列包成 BlockingQueueProxy，而它的 take() 实现是「return poll()」——无参 poll 非阻塞，取不到任务立即返回 null",
+                "触发条件：ThreadPoolExecutor.getTask() 里 timed = allowCoreThreadTimeOut || wc > corePoolSize。固定池里 wc 永远不超过 corePoolSize，所以 timed 完全由 allowCoreThreadTimeOut 决定；为 true 才走 poll(keepAliveTime) 的阻塞分支，为 false 就调 take() 空转",
+                "真机默认该开关为 true，核心线程永远走 poll(timeout)，take() 从不被调用，所以上游从未暴露这个缺陷；是我们之前为修 Scheduled 池把它关成 false 才踩中",
+                "第一次尝试用 inline hook 单修 take()，结果本机 Pine 在 pine::Android::InitMembersFromRuntime 里 Data Abort、Pine_init0 直接 SIGABRT，虚拟进程起不来（dropbox 有 tombstone），遂放弃 hook",
+                "最终改法：把 allowAllCoreThreadTimeOut 与 enableBlockFetchTask 双双置回 true（后者必须为 true，否则 poll(timeout) 同样退化成无参 poll），线程收敛位掩码仍清 0",
+                "代价是 Scheduled 池会把 keepAliveTime 设成 30 毫秒并允许核心线程超时，核心线程可能被频繁重建；但有 ensurePrestart() 兜底，功能可用，与「整机满载发烫」代价不对等"
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 93,
             versionName = "0.9.29",
             title = "修复哔哩哔哩启动即闪退：补齐 locale 系统服务代理",
