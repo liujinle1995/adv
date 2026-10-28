@@ -514,17 +514,12 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
             if (old == null) return;
             if (java.lang.reflect.Modifier.isFinal(f.getModifiers())) return;
 
-            final java.util.concurrent.atomic.AtomicInteger seq =
-                    new java.util.concurrent.atomic.AtomicInteger();
+            // 原来是 newCachedThreadPool（线程数无上限）。红果这类应用会在这几个池上
+            // 叠加埋点 / 预加载 / 广告上报，突发时线程数可以顶到几十个，8 核直接被拉满
+            // （实测平板端沙箱进程吃掉 783% CPU、loadavg 97、CPU 结温 100°C）。
+            // 改成固定并发池：并发封顶，任务排队不丢，代价只是排队变长。
             java.util.concurrent.ExecutorService pool =
-                    java.util.concurrent.Executors.newCachedThreadPool(new java.util.concurrent.ThreadFactory() {
-                        @Override
-                        public Thread newThread(Runnable r) {
-                            Thread t = new Thread(r, threadPrefix + "-" + seq.incrementAndGet());
-                            t.setDaemon(false);
-                            return t;
-                        }
-                    });
+                    newFixedPool(threadPrefix, POOL_TT_EXECUTORS);
             f.set(null, pool);
             top.niunaijun.blackbox.utils.DiagLog.log("Exec",
                     "replaced " + fieldName + ": " + old.getClass().getSimpleName()
@@ -893,6 +888,9 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 sTargetApp = app;
             }
             startDiagPoller(app);
+            // 把埋点 / 监控 / 预加载这类旁路线程压到后台优先级：沙箱进程在 vip
+            // cgroup 里，系统永远不会替它降级，这件事只能自己做。
+            startSideTaskThrottler(app);
         }
         try {
             super.callApplicationOnCreate(app);
@@ -1646,6 +1644,222 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
         top.niunaijun.blackbox.utils.DiagLog.log("Diag", "poller started");
     }
 
+    // ------------------------------------------------------------------
+    // 旁路线程降级（A）
+    //
+    // 实测数据决定这个功能该怎么做：
+    //   · 停在短剧播放页时，沙箱进程吃掉 783%/800% CPU，8 核全满、loadavg 97；
+    //   · 退回首页后，同一个进程只剩 23%。
+    // 也就是说发热来自「播放页上的并发任务爆炸」，不是后台常驻空转。
+    // 如果只在「空闲」时降级，播放中音频一直活跃、永远不会触发 —— 等于没用。
+    //
+    // 所以这里做成常驻的：启动 15 秒后开始，每 60 秒扫一次线程表，把埋点 / 监控 /
+    // 上报 / 预加载这类「旁路」线程统一降到 THREAD_PRIORITY_BACKGROUND。
+    // 这些活本来就该给播放、解码和 UI 让路；CPU 满载时能实打实让出份额，而且它们
+    // 多是 sleep 轮询型任务，权重一低，实际跑的频率也跟着降下来。
+    //
+    // 保护名单覆盖 UI / 渲染 / 解码 / 音频 / binder / GC，一个都不碰。
+    //
+    // 注意：Linux 只允许非特权进程「降低」调度优先级，nice 降下去抬不回来。
+    // 因此只对明确属于旁路工作的线程名生效，宁可少降也不误伤。
+    // ------------------------------------------------------------------
+    private static final long THROTTLE_FIRST_DELAY_MS = 15_000L;
+    private static final long THROTTLE_RESCAN_MS = 60_000L;
+    private static final int SIDE_THREAD_PRIORITY = 10; // THREAD_PRIORITY_BACKGROUND
+    /** 取消特权时降到标准优先级，不压到后台。 */
+    private static final int NORMAL_PRIORITY = 0;
+
+    private static volatile boolean sSideThrottlerStarted;
+
+    /** 命中这些片段的线程才允许降级：全是可延迟、可让路的旁路工作。 */
+    private static final String[] SIDE_DELAYABLE = {
+            "alog", "Alog", "Monitor", "monitor", "Report", "report",
+            "trace", "Trace", "DTP", "Hybrid", "preload", "Preload",
+            "stagger", "bullet", "TMThreadUtils", "BasicRoute",
+            "throttle_level", "looper_monitor", "RewardAd", "A-DelayTask",
+    };
+
+    /**
+     * 这些是被 App 抬到负 nice、却在做屏外工作的线程：实测 lynx-card-service
+     * 和 LynxTimingCoroutine 在全屏播放时占了约 1.2 个核，而屏幕上根本没有卡片。
+     * 只取消特权（降到 0），不做进一步压制，避免 Feed 滚动明显变卡。
+     */
+    private static final String[] PRIVILEGE_DEMOTE = {
+            "lynx", "Lynx",
+    };
+
+    /** 命中这些片段的线程一律不动：UI、渲染、解码、音频、binder、GC。 */
+    private static final String[] SIDE_PROTECTED = {
+            "main", "Render", "hwui", "Codec", "codec", "Audio", "audio",
+            "GL", "binder", "Binder", "Signal", "Jit", "HeapTask",
+            "Finalizer", "Reference", "JDWP", "surface", "Surface",
+            "play", "Play", "video", "Video", "Decod", "encod",
+    };
+
+    private static void startSideTaskThrottler(final Application app) {
+        if (sSideThrottlerStarted) {
+            return;
+        }
+        sSideThrottlerStarted = true;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                // 等应用自己的初始化跑完，线程池建得差不多了再动手。
+                try {
+                    Thread.sleep(THROTTLE_FIRST_DELAY_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                while (true) {
+                    try {
+                        throttleSideThreads();
+                        Thread.sleep(THROTTLE_RESCAN_MS);
+                    } catch (InterruptedException e) {
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }, "adv-side-throttle");
+        t.setDaemon(true);
+        t.start();
+        top.niunaijun.blackbox.utils.DiagLog.log("Prio", "side-task throttler started");
+    }
+
+    /**
+     * 扫一遍本进程线程表，分两档处理：
+     *
+     * 1. 旁路线程（埋点/监控/预加载）→ THREAD_PRIORITY_BACKGROUND(10)；
+     * 2. 渲染框架里那些「被 App 抬到负 nice、但又不在用户视野里」的线程
+     *    （实测是 Lynx 的卡片服务和计时协程，nice=-8，优先级比播放器还高）
+     *    → 只取消它们的特权，降到标准 0，不进一步压低。
+     *    这样播放链路能排到它们前面，又不至于让 Feed 滚动明显变卡。
+     */
+    private static void throttleSideThreads() {
+        try {
+            String[] tids = new java.io.File("/proc/self/task").list();
+            if (tids == null) {
+                return;
+            }
+            int hit = 0;
+            int demoted = 0;
+            int failed = 0;
+            StringBuilder sample = new StringBuilder();
+            for (String tid : tids) {
+                String comm = readThreadComm(tid);
+                if (comm == null || comm.length() == 0) {
+                    continue;
+                }
+                int target;
+                if (isSideThread(comm)) {
+                    target = SIDE_THREAD_PRIORITY;
+                } else if (isPrivilegedSideThread(comm) && readThreadNice(tid) < 0) {
+                    target = NORMAL_PRIORITY;
+                } else {
+                    continue;
+                }
+                try {
+                    android.os.Process.setThreadPriority(Integer.parseInt(tid), target);
+                    if (target == NORMAL_PRIORITY) {
+                        demoted++;
+                    } else {
+                        hit++;
+                    }
+                    if (sample.length() < 200) {
+                        sample.append(comm).append('(').append(target).append(')').append(',');
+                    }
+                } catch (Throwable e) {
+                    failed++;
+                }
+            }
+            top.niunaijun.blackbox.utils.DiagLog.log("Prio",
+                    "side throttled=" + hit + " demoted=" + demoted
+                            + " failed=" + failed + " sample=" + sample);
+        } catch (Throwable t) {
+            top.niunaijun.blackbox.utils.DiagLog.log("Prio",
+                    "throttle failed: " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static String readThreadComm(String tid) {
+        java.io.FileInputStream in = null;
+        try {
+            in = new java.io.FileInputStream("/proc/self/task/" + tid + "/comm");
+            byte[] buf = new byte[64];
+            int n = in.read(buf);
+            if (n <= 0) {
+                return null;
+            }
+            return new String(buf, 0, n, "UTF-8").trim();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private static boolean isSideThread(String comm) {
+        for (String p : SIDE_PROTECTED) {
+            if (comm.contains(p)) {
+                return false;
+            }
+        }
+        for (String d : SIDE_DELAYABLE) {
+            if (comm.contains(d)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isPrivilegedSideThread(String comm) {
+        for (String p : PRIVILEGE_DEMOTE) {
+            if (comm.contains(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 读 /proc/self/task/<tid>/stat 第 19 字段（nice）；读不到返回 MAX_VALUE 表示不动。 */
+    private static int readThreadNice(String tid) {
+        java.io.FileInputStream in = null;
+        try {
+            in = new java.io.FileInputStream("/proc/self/task/" + tid + "/stat");
+            byte[] buf = new byte[512];
+            int n = in.read(buf);
+            if (n <= 0) {
+                return Integer.MAX_VALUE;
+            }
+            String s = new String(buf, 0, n, "UTF-8");
+            // comm 可能含空格，先跳到最后一个 ')' 之后再按空格切分。
+            int end = s.lastIndexOf(')');
+            if (end < 0) {
+                return Integer.MAX_VALUE;
+            }
+            String[] f = s.substring(end + 1).trim().split(" ");
+            // ')' 之后第 1 个是字段 3（state），字段 19（nice）是第 17 个。
+            if (f.length < 17) {
+                return Integer.MAX_VALUE;
+            }
+            return Integer.parseInt(f[16]);
+        } catch (Throwable t) {
+            return Integer.MAX_VALUE;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     /** 一次性把关键运行时状态打进日志。 */
     /**
      * 找出「请求进去了但没被执行」的那个队列。
@@ -1793,8 +2007,27 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
      * 丢失的是优先级排序和延迟调度，换来的是请求真的能发出去。
      *
      * sRequestQueue 的声明类型是接口 jb0.a，所以可以用 Proxy 顶上。
+     *
+     * 反汇编确认过语义（base.apk / classes21.dex）：
+     *   jb0.a 只有两个方法，都返回 void —— a(c) 和 b(c) 都是「提交」，
+     *   分别转调 dispatcher.d.h.f() 和 dispatcher.d.h.e()。
+     * 所以 Proxy 一律返回 null 是符合签名的，不存在「返回 false 触发重试」的问题。
+     *
+     * 但接管会绕过 dispatcher.d 那一层的调度：优先级、并发上限、请求去重/合并。
+     * 丢掉去重后，预加载和用户请求重复的部分会各跑一遍，等于凭空多出工作量。
+     * 而现在 dispatcher.d 的池我们已经换成了可用的池（replaceDispatcherPools），
+     * 原队列理论上能自己跑起来，所以做成一个开关，用来 A/B 验证到底哪种更省。
      */
+    /** true=接管 sRequestQueue（快但丢调度）；false=保留原队列，只修好它的池。 */
+    private static final boolean QUEUE_TAKEOVER = false;
+
     private static void installRequestQueue(Application app) {
+        if (!QUEUE_TAKEOVER) {
+            // 沿用原队列：请求重新走 dispatcher.d 的调度（并发上限 + 去重），
+            // 池本身已由 replaceDispatcherPools 换成可用的池。
+            replaceDispatcherPools(app);
+            return;
+        }
         try {
             ClassLoader cl = app.getClassLoader();
             // 注意：接口的真实类名就是顶层包 jb0.a（之前误加了 dispatcher 前缀，导致 CNFE）
@@ -1970,21 +2203,12 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                                     + " queued=" + op.getQueue().size()
                                     + " done=" + op.getCompletedTaskCount());
                 }
+                // 原来写的 (2, 8) 配无界队列其实名不副实：无界队列下线程数永远
+                // 停在 corePoolSize=2，max 根本用不上。直接写成固定 3 并保留
+                // 「核心线程可超时」，语义清楚，并发也封住了。
                 java.util.concurrent.ThreadPoolExecutor pool =
-                        new java.util.concurrent.ThreadPoolExecutor(
-                                2, 8, 30L, java.util.concurrent.TimeUnit.SECONDS,
-                                new java.util.concurrent.LinkedBlockingQueue<Runnable>(),
-                                new java.util.concurrent.ThreadFactory() {
-                                    private final java.util.concurrent.atomic.AtomicInteger seq =
-                                            new java.util.concurrent.atomic.AtomicInteger(1);
-
-                                    @Override
-                                    public Thread newThread(Runnable r) {
-                                        Thread t = new Thread(r, "adv-disp-" + seq.getAndIncrement());
-                                        t.setDaemon(true);
-                                        return t;
-                                    }
-                                });
+                        (java.util.concurrent.ThreadPoolExecutor)
+                                newFixedPool("adv-disp", POOL_DISPATCHER);
                 pool.allowCoreThreadTimeOut(true);
                 f.set(d, pool);
                 n++;
@@ -1999,19 +2223,10 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     }
 
     private static final class RequestQueueHandler implements java.lang.reflect.InvocationHandler {
+        // 这个池接管了字节的整个请求队列，原来用 newCachedThreadPool 完全没有上限：
+        // 预加载 + 广告 + 推荐流同时放量时会瞬间堆出大量线程。改成固定并发。
         static final java.util.concurrent.ExecutorService POOL =
-                java.util.concurrent.Executors.newCachedThreadPool(
-                        new java.util.concurrent.ThreadFactory() {
-                            private final java.util.concurrent.atomic.AtomicInteger seq =
-                                    new java.util.concurrent.atomic.AtomicInteger(1);
-
-                            @Override
-                            public Thread newThread(Runnable r) {
-                                Thread t = new Thread(r, "adv-net-" + seq.getAndIncrement());
-                                t.setDaemon(true);
-                                return t;
-                            }
-                        });
+                newFixedPool("adv-net", POOL_NET);
 
         @Override
         public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
@@ -2491,19 +2706,27 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
     private static volatile java.util.concurrent.Executor sRxSinglePool;
 
     private static java.util.concurrent.Executor newAdvExecutor(final String name) {
-        return java.util.concurrent.Executors.newCachedThreadPool(
-                new java.util.concurrent.ThreadFactory() {
-                    private final java.util.concurrent.atomic.AtomicInteger seq =
-                            new java.util.concurrent.atomic.AtomicInteger(1);
-
-                    @Override
-                    public Thread newThread(Runnable r) {
-                        Thread t = new Thread(r, name + "-" + seq.getAndIncrement());
-                        t.setDaemon(true);
-                        return t;
-                    }
-                });
+        return newFixedPool(name, POOL_RX);
     }
+
+    // ------------------------------------------------------------------
+    // 并发上限（B）。
+    //
+    // 背景：平板端实测沙箱进程吃满 783%/800% CPU，408 个线程里 83 个处于 R 态，
+    // loadavg 97 且持续爬升，CPU 结温 94–103°C。我们接管的这几个池原本全是
+    // newCachedThreadPool —— 线程数无上限，等于把 App 的突发流量直接放行成线程风暴。
+    //
+    // 这里统一改成固定并发：任务排队不丢（队列无界），只是同时执行的线程数封顶。
+    // 该值是实测后取的折中：并发明显下降，但单条视频的图片/分片请求仍能并行拉满带宽。
+    // ------------------------------------------------------------------
+    /** 字节 TTExecutors 的四个池（normal / io / bg / cpu）。 */
+    private static final int POOL_TT_EXECUTORS = 4;
+    /** dispatcher 里那 5 个网络池。 */
+    private static final int POOL_DISPATCHER = 3;
+    /** 接管过来的请求队列。 */
+    private static final int POOL_NET = 6;
+    /** RxJava 兜底调度器（正常走原生 Scheduler，这里只在反查失败时用）。 */
+    private static final int POOL_RX = 8;
 
     /**
      * 把 RxJava 的 io / computation / single / newThread 全部接到自建线程池上。
@@ -2534,6 +2757,22 @@ public final class AppInstrumentation extends BaseInstrumentationDelegate implem
                 return t;
             }
         };
+    }
+
+    /**
+     * 固定并发池：线程数封顶，任务进无界队列排队。
+     *
+     * 刻意不用有界队列 + CallerRunsPolicy：那会让提交线程亲自跑 HTTP 任务，
+     * 一旦提交方正好持着锁，就有互相等死的风险；而丢弃策略会让请求回调永远不来，
+     * 表现为界面一直转圈。这里只封并发、不丢任务、不阻塞提交方。
+     */
+    private static java.util.concurrent.ExecutorService newFixedPool(
+            final String name, int threads) {
+        return new java.util.concurrent.ThreadPoolExecutor(
+                threads, threads,
+                30L, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+                newAdvThreadFactory(name));
     }
 
     /**
