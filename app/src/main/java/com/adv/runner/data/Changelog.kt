@@ -21,6 +21,19 @@ object Changelog {
     /** 按 versionCode 降序（新版本在上）。 */
     val entries: List<ChangelogEntry> = listOf(
         ChangelogEntry(
+            versionCode = 92,
+            versionName = "0.9.28",
+            title = "可靠性与可测性：不再把失败伪装成空列表，补齐状态机/迁移/兼容矩阵测试",
+            highlights = listOf(
+                "实例读取失败不再返回空列表：对账结果改成 ReconcileOutcome（区分「真的没有实例」与「读不出来」），读盘失败直接把首页置为失败态并提供重试",
+                "对账与持久化的失败不再静默：落盘失败、各条实例取证失败会在首页顶部横幅说明，并写入 RECONCILE 事件；安装前读不到已有清单会中止而不是硬装撞唯一索引",
+                "旧版数据迁移：文件损坏时保留原文件并报错，不再「读失败→当成空→改名 .bak」把用户数据藏起来",
+                "引擎能力统一三态（支持 / 不支持 / 未验证），取消模糊的「部分支持」，调用点统一走 CapabilityDecision（放行 / 拦截 / 需确认）",
+                "新增 64 个 JVM 单元测试：状态机与异常退出推断、对账失败路径、迁移成败、兼容性矩阵（API 31–37 × 5 种 ABI 组合）、厂商 ROM 识别、数据库结构守卫",
+                "兼容性判定抽成纯函数 CompatibilityRules + DeviceProfile，导入时按设备快照判定，可穷举可回归；文档见 docs/12-test-matrix.md"
+            ),
+        ),
+        ChangelogEntry(
             versionCode = 91,
             versionName = "0.9.27",
             title = "实例操作收口为一行三个：启动 / 停止 合二为一",

@@ -18,8 +18,8 @@ android {
         // 需求：最低支持 Android 12（API 31），最高支持 Android 17（API 37）
         minSdk = 31
         targetSdk = 37
-        versionCode = 91
-        versionName = "0.9.27"
+        versionCode = 92
+        versionName = "0.9.28"
 
         ndk {
             // 目标设备（realme RMX3888 / Android 16）无 32 位运行时
@@ -68,6 +68,20 @@ android {
     lint {
         abortOnError = false
     }
+
+    testOptions {
+        unitTests {
+            // 单元测试只覆盖纯 Kotlin 逻辑（状态机/兼容性判定/迁移计划），
+            // 不依赖 android.jar 的桩实现；万一误用到 Android API，让它显式抛错。
+            isReturnDefaultValues = false
+        }
+    }
+}
+
+// Room 导出 schema：迁移与结构守卫测试的比对基线。
+// 每次实体/版本变更都会重新生成，配合 DbSchemaTest 防止「改了实体忘了升版本」。
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
@@ -90,6 +104,12 @@ dependencies {
     ksp("androidx.room:room-compiler:$roomVersion")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // ---- 本地单元测试（JVM，不需要设备/模拟器）----
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    // 真实 org.json 实现：单测里没有 android.jar 的桩，映射与 schema 解析都要它
+    testImplementation("org.json:json:20240303")
 }
 
 // ---------------------------------------------------------------------------

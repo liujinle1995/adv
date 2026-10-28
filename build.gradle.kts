@@ -8,3 +8,19 @@ plugins {
     // Room 注解处理用 KSP（Kotlin 2.0 下 KAPT 已被官方建议替换）
     id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
 }
+
+// ---------------------------------------------------------------------------
+// 引擎模块（third_party/blackbox）自带的示例单测是上游骨架（`2 + 2 == 4`），
+// 没有声明 junit 依赖，跑 `gradle test` 时会在编译期失败、把整个测试任务带崩。
+// 这些模块属于第三方代码，我们不做单测覆盖，直接关掉它们的测试任务；
+// 本项目自己的测试全部在 :app 下（纯 JVM，不需要设备）。
+// ---------------------------------------------------------------------------
+subprojects {
+    if (name.startsWith("bb-")) {
+        // 补上 junit，让上游示例单测至少能编译通过（它们不参与我们的测试目标）
+        plugins.withId("com.android.library") {
+            dependencies.add("testImplementation", "junit:junit:4.13.2")
+        }
+        tasks.matching { it.name.startsWith("test") }.configureEach { enabled = false }
+    }
+}

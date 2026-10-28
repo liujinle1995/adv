@@ -11,7 +11,8 @@ import androidx.room.RoomDatabase
  * - version 1 是全新库，暂无历史迁移；阶段 3.2 会把 JSON/JSONL 文件里的既有数据
  *   一次性迁入，而不是把文件存储当作 Room 的「旧版本」。
  *
- * `exportSchema` 暂时关闭；等进入需要验证迁移的阶段，再打开并配置 schemaLocation。
+ * `exportSchema` 已打开（schemaLocation 见 app/build.gradle.kts）：导出的 JSON 是
+ * `DbSchemaTest` 的比对基线，实体改动而忘了升版本会被它拦下。
  */
 @Database(
     entities = [
@@ -21,7 +22,7 @@ import androidx.room.RoomDatabase
         EngineProfileEntity::class
     ],
     version = 1,
-    exportSchema = false
+    exportSchema = true
 )
 abstract class AdvDatabase : RoomDatabase() {
     abstract fun apkInfoDao(): ApkInfoDao

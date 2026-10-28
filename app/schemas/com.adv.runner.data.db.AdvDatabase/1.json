@@ -1,0 +1,469 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 1,
+    "identityHash": "4e1772565de9e37377ee3d17f6f93876",
+    "entities": [
+      {
+        "tableName": "apk_info",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `package_name` TEXT NOT NULL, `version_name` TEXT NOT NULL, `version_code` INTEGER NOT NULL, `app_label` TEXT NOT NULL, `sha256` TEXT NOT NULL, `file_size` INTEGER NOT NULL, `stored_path` TEXT NOT NULL, `original_name` TEXT, `signer_sha256` TEXT NOT NULL, `signer_subject` TEXT, `min_sdk` INTEGER NOT NULL, `target_sdk` INTEGER NOT NULL, `compile_sdk` INTEGER, `abis` TEXT NOT NULL, `permissions` TEXT NOT NULL, `launcher_activity` TEXT, `components` TEXT NOT NULL, `is_split` INTEGER NOT NULL, `is_debuggable` INTEGER NOT NULL, `imported_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "package_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "versionName",
+            "columnName": "version_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "versionCode",
+            "columnName": "version_code",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appLabel",
+            "columnName": "app_label",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sha256",
+            "columnName": "sha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fileSize",
+            "columnName": "file_size",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "storedPath",
+            "columnName": "stored_path",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originalName",
+            "columnName": "original_name",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "signerSha256",
+            "columnName": "signer_sha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "signerSubject",
+            "columnName": "signer_subject",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "minSdk",
+            "columnName": "min_sdk",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "targetSdk",
+            "columnName": "target_sdk",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "compileSdk",
+            "columnName": "compile_sdk",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "abis",
+            "columnName": "abis",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "permissions",
+            "columnName": "permissions",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "launcherActivity",
+            "columnName": "launcher_activity",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "components",
+            "columnName": "components",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isSplit",
+            "columnName": "is_split",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isDebuggable",
+            "columnName": "is_debuggable",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "importedAt",
+            "columnName": "imported_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_apk_info_sha256",
+            "unique": true,
+            "columnNames": [
+              "sha256"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_apk_info_sha256` ON `${TABLE_NAME}` (`sha256`)"
+          },
+          {
+            "name": "index_apk_info_package_name_version_code",
+            "unique": false,
+            "columnNames": [
+              "package_name",
+              "version_code"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_apk_info_package_name_version_code` ON `${TABLE_NAME}` (`package_name`, `version_code`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "runtime_instance",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `apk_id` TEXT, `package_name` TEXT NOT NULL, `display_name` TEXT NOT NULL, `engine_id` TEXT NOT NULL, `engine_version` TEXT NOT NULL, `virtual_user_id` INTEGER NOT NULL, `state` TEXT NOT NULL, `signature_mode` TEXT NOT NULL, `signature_ack_at` INTEGER, `installed_version_code` INTEGER, `installed_at` INTEGER, `last_launched_at` INTEGER, `last_exit_reason` TEXT, `data_root` TEXT NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "apkId",
+            "columnName": "apk_id",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "package_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "display_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "engineId",
+            "columnName": "engine_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "engineVersion",
+            "columnName": "engine_version",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "virtualUserId",
+            "columnName": "virtual_user_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "signatureMode",
+            "columnName": "signature_mode",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "signatureAckAt",
+            "columnName": "signature_ack_at",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "installedVersionCode",
+            "columnName": "installed_version_code",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "installedAt",
+            "columnName": "installed_at",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "lastLaunchedAt",
+            "columnName": "last_launched_at",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "lastExitReason",
+            "columnName": "last_exit_reason",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "dataRoot",
+            "columnName": "data_root",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "created_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updated_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_runtime_instance_engine_id_virtual_user_id",
+            "unique": true,
+            "columnNames": [
+              "engine_id",
+              "virtual_user_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_runtime_instance_engine_id_virtual_user_id` ON `${TABLE_NAME}` (`engine_id`, `virtual_user_id`)"
+          },
+          {
+            "name": "index_runtime_instance_state",
+            "unique": false,
+            "columnNames": [
+              "state"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_runtime_instance_state` ON `${TABLE_NAME}` (`state`)"
+          },
+          {
+            "name": "index_runtime_instance_package_name",
+            "unique": false,
+            "columnNames": [
+              "package_name"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_runtime_instance_package_name` ON `${TABLE_NAME}` (`package_name`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "run_event",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `instance_id` TEXT, `package_name` TEXT, `ts` INTEGER NOT NULL, `level` TEXT NOT NULL, `kind` TEXT NOT NULL, `code` TEXT, `message` TEXT NOT NULL, `log_file` TEXT, `detail_ref` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "instanceId",
+            "columnName": "instance_id",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "package_name",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "ts",
+            "columnName": "ts",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "level",
+            "columnName": "level",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "code",
+            "columnName": "code",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "message",
+            "columnName": "message",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "logFile",
+            "columnName": "log_file",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "detailRef",
+            "columnName": "detail_ref",
+            "affinity": "TEXT",
+            "notNull": false
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_run_event_instance_id_ts",
+            "unique": false,
+            "columnNames": [
+              "instance_id",
+              "ts"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_run_event_instance_id_ts` ON `${TABLE_NAME}` (`instance_id`, `ts`)"
+          },
+          {
+            "name": "index_run_event_ts",
+            "unique": false,
+            "columnNames": [
+              "ts"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_run_event_ts` ON `${TABLE_NAME}` (`ts`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "engine_profile",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`engine_id` TEXT NOT NULL, `engine_version` TEXT NOT NULL, `device_sdk` INTEGER NOT NULL, `device_abis` TEXT NOT NULL, `capabilities` TEXT NOT NULL, `last_check_at` INTEGER NOT NULL, `last_result` TEXT NOT NULL, PRIMARY KEY(`engine_id`))",
+        "fields": [
+          {
+            "fieldPath": "engineId",
+            "columnName": "engine_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "engineVersion",
+            "columnName": "engine_version",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deviceSdk",
+            "columnName": "device_sdk",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deviceAbis",
+            "columnName": "device_abis",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "capabilities",
+            "columnName": "capabilities",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastCheckAt",
+            "columnName": "last_check_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastResult",
+            "columnName": "last_result",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "engine_id"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '4e1772565de9e37377ee3d17f6f93876')"
+    ]
+  }
+}
